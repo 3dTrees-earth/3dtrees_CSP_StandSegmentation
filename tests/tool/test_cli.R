@@ -32,7 +32,39 @@ stopifnot(
   length(config$segmentation_specs) == 2L,
   identical(config$dtm_resolution, 0.2),
   identical(config$routing_workers, 1L),
+  identical(config$read_chunk_size, 25),
+  identical(config$chunk_buffer, 5),
+  identical(config$inventory_partitions, 64L),
   !config$enable_csp
+)
+
+edge_chunks <- spatial_chunks(list(xmin = 0, xmax = 25, ymin = 0, ymax = 25), 25)
+stopifnot(
+  length(edge_chunks) == 4L,
+  any(vapply(edge_chunks, function(chunk) chunk[["xmin"]] == 25, logical(1))),
+  any(vapply(edge_chunks, function(chunk) chunk[["ymin"]] == 25, logical(1)))
+)
+
+dimensions <- inventory_read_dimensions(config$segmentation_specs)
+stopifnot(
+  identical(
+    dimensions,
+    c(
+      "PredInstance_SAT", "PredInstance_FM", "species_id_FM",
+      "species_prob_FM", "PredScore_FM", "PredSemantic_FM"
+    )
+  ),
+  identical(
+    build_read_selector(
+      dimensions,
+      c(
+        "unused", "PredInstance_FM", "species_id_FM", "species_prob_FM",
+        "PredScore_FM", "PredSemantic_FM", "PredInstance_SAT"
+      )
+    ),
+    "c234567"
+  ),
+  identical(build_read_selector("late_dimension", c(rep("unused", 9L), "late_dimension")), "c0")
 )
 
 expect_error(

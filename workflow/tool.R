@@ -6,17 +6,93 @@ resolve_input_files <- function(path) {
   sort(normalizePath(files, mustWork = TRUE))
 }
 
-read_point_cloud <- function(files) {
-  if (length(files) == 1L) {
-    las <- suppressWarnings(lidR::readLAS(files, select = "*"))
-  } else {
-    clouds <- lapply(files, function(file) suppressWarnings(lidR::readLAS(file, select = "*")))
-    if (any(vapply(clouds, function(cloud) is.null(cloud) || lidR::is.empty(cloud), logical(1)))) {
-      abort("At least one input point-cloud file is empty")
+inventory_read_dimensions <- function(specs) {
+  dimensions <- unlist(lapply(specs, function(spec) {
+    result <- c(spec$instance, spec$species, spec$species_prob)
+    if (identical(spec$source, "FM")) {
+      result <- c(result, "PredScore_FM", "PredSemantic_FM")
     }
+    result
+  }), use.names = FALSE)
+  unique(dimensions[!is.na(dimensions) & nzchar(dimensions)])
+}
+
+extra_byte_names <- function(header) {
+  extra_bytes <- header@VLR$Extra_Bytes[["Extra Bytes Description"]]
+  if (is.null(extra_bytes)) character() else names(extra_bytes)
+}
+
+build_read_selector <- function(dimensions, extra_dimensions) {
+  standard_codes <- c(
+    gpstime = "t", ScanAngle = "a", Intensity = "i",
+    NumberOfReturns = "n", ReturnNumber = "r", Classification = "c",
+    Synthetic_flag = "s", Keypoint_flag = "k", Withheld_flag = "w",
+    Overlap_flag = "o", UserData = "u", PointSourceID = "p",
+    EdgeOfFlightline = "e", ScanDirectionFlag = "d", R = "R", G = "G",
+    B = "B", NIR = "N", ScannerChannel = "C", Waveform = "W"
+  )
+  standard <- unname(standard_codes[intersect(dimensions, names(standard_codes))])
+  positions <- sort(match(intersect(dimensions, extra_dimensions), extra_dimensions))
+
+  # LASlib can address only the first nine extra-byte records individually.
+  # If a requested dimension is later, load all extra bytes rather than risk
+  # silently omitting a requested inventory field.
+  extra <- if (any(positions > 9L)) "0" else as.character(positions)
+  paste0(unique(c("c", standard, extra)), collapse = "")
+}
+
+read_selector <- function(file, specs, preserve_all_dimensions) {
+  if (preserve_all_dimensions) return("*")
+  header <- lidR::readLASheader(file)
+  build_read_selector(inventory_read_dimensions(specs), extra_byte_names(header))
+}
+
+project_inventory_dimensions <- function(las, specs) {
+  available <- names(las@data)
+  keep <- unique(c(
+    "X", "Y", "Z", intersect("Classification", available),
+    intersect(inventory_read_dimensions(specs), available)
+  ))
+  dropped <- setdiff(available, keep)
+  las@data <- las@data[, ..keep]
+
+  extra_bytes <- las@header@VLR$Extra_Bytes[["Extra Bytes Description"]]
+  if (!is.null(extra_bytes)) {
+    for (dimension in setdiff(names(extra_bytes), keep)) {
+      las@header@VLR$Extra_Bytes[["Extra Bytes Description"]][[dimension]] <- NULL
+    }
+  }
+  attr(las, "dropped_dimensions") <- dropped
+  las
+}
+
+read_point_cloud <- function(files, specs, preserve_all_dimensions = FALSE) {
+  selectors <- vapply(
+    files,
+    read_selector,
+    character(1),
+    specs = specs,
+    preserve_all_dimensions = preserve_all_dimensions
+  )
+  clouds <- Map(function(file, select) {
+    cloud <- suppressWarnings(lidR::readLAS(file, select = select))
+    if (is.null(cloud) || lidR::is.empty(cloud)) return(cloud)
+    if (!preserve_all_dimensions) cloud <- project_inventory_dimensions(cloud, specs)
+    cloud
+  }, files, selectors)
+  if (any(vapply(clouds, function(cloud) is.null(cloud) || lidR::is.empty(cloud), logical(1)))) {
+    abort("At least one input point-cloud file is empty")
+  }
+  dropped_dimensions <- unique(unlist(lapply(clouds, attr, which = "dropped_dimensions")))
+  if (is.null(dropped_dimensions)) dropped_dimensions <- character()
+  if (length(files) == 1L) {
+    las <- clouds[[1L]]
+  } else {
     las <- CspStandSegmentation::las_merge(clouds, fill = TRUE)
   }
   if (is.null(las) || lidR::is.empty(las)) abort("The input point cloud is empty")
+  attr(las, "read_selectors") <- stats::setNames(unname(selectors), basename(files))
+  attr(las, "dropped_dimensions") <- dropped_dimensions
   las
 }
 
@@ -196,7 +272,26 @@ inventory_for_spec <- function(las, spec, config, aoi, crs) {
     }
   )
 
-  if (is.null(measured) || !nrow(measured)) {
+  # Upstream simplifies a one-tree inventory to an 8x1 matrix/data frame whose
+  # field names are row names. Restore the same one-row schema returned for
+  # multi-tree calls before applying the normal merge path.
+  if (!is.null(measured) && nrow(measured) && !instance %in% names(measured) && ncol(measured) == 1L) {
+    fields <- rownames(measured)
+    required_fields <- c(instance, "X", "Y", "Z", "DBH", "quality_flag", "Height", "ConvexHullArea")
+    if (all(required_fields %in% fields)) {
+      values <- as.numeric(measured[[1L]])
+      names(values) <- fields
+      measured <- data.table::as.data.table(as.list(values))
+    }
+  }
+
+  if (is.null(measured) || !nrow(measured) || !instance %in% names(measured)) {
+    if (!is.null(measured) && nrow(measured) && !instance %in% names(measured)) {
+      warning(sprintf(
+        "Inventory measurements for %s omitted the instance column; using fallback measurements for this partition",
+        instance
+      ))
+    }
     measured <- data.table::data.table(
       instance_id = numeric(), X = numeric(), Y = numeric(), Z = numeric(),
       DBH = numeric(), quality_flag = integer(), Height = numeric(), ConvexHullArea = numeric()
@@ -414,6 +509,273 @@ publish_stage <- function(stage_dir, output_dir) {
   unlink(stage_dir, recursive = TRUE, force = TRUE)
 }
 
+point_cloud_bounds <- function(files) {
+  headers <- lapply(files, lidR::readLASheader)
+  list(
+    xmin = min(vapply(headers, function(x) x@PHB[["Min X"]], numeric(1))),
+    xmax = max(vapply(headers, function(x) x@PHB[["Max X"]], numeric(1))),
+    ymin = min(vapply(headers, function(x) x@PHB[["Min Y"]], numeric(1))),
+    ymax = max(vapply(headers, function(x) x@PHB[["Max Y"]], numeric(1))),
+    headers = headers
+  )
+}
+
+spatial_chunks <- function(bounds, size) {
+  x_breaks <- seq(floor(bounds$xmin / size) * size, ceiling(bounds$xmax / size) * size, by = size)
+  y_breaks <- seq(floor(bounds$ymin / size) * size, ceiling(bounds$ymax / size) * size, by = size)
+  if (length(x_breaks) < 2L) x_breaks <- c(x_breaks, x_breaks + size)
+  if (length(y_breaks) < 2L) y_breaks <- c(y_breaks, y_breaks + size)
+  # Core reads are half-open on their upper edges to avoid double counting.
+  # Add a final interval when the point-cloud maximum lies exactly on a grid
+  # line so points on that maximum are still assigned to one chunk.
+  if (tail(x_breaks, 1L) <= bounds$xmax) x_breaks <- c(x_breaks, tail(x_breaks, 1L) + size)
+  if (tail(y_breaks, 1L) <= bounds$ymax) y_breaks <- c(y_breaks, tail(y_breaks, 1L) + size)
+  grid <- expand.grid(x = seq_len(length(x_breaks) - 1L), y = seq_len(length(y_breaks) - 1L))
+  lapply(seq_len(nrow(grid)), function(index) {
+    x <- grid$x[[index]]
+    y <- grid$y[[index]]
+    c(xmin = x_breaks[[x]], xmax = x_breaks[[x + 1L]], ymin = y_breaks[[y]], ymax = y_breaks[[y + 1L]])
+  })
+}
+
+read_spatial_chunk <- function(files, selectors, extent, specs = NULL) {
+  filter <- sprintf(
+    "-keep_xy %.10f %.10f %.10f %.10f",
+    extent[["xmin"]], extent[["ymin"]], extent[["xmax"]], extent[["ymax"]]
+  )
+  clouds <- Map(function(file, select) {
+    cloud <- suppressWarnings(lidR::readLAS(file, select = select, filter = filter))
+    if (!is.null(cloud) && !lidR::is.empty(cloud) && !is.null(specs)) {
+      cloud <- project_inventory_dimensions(cloud, specs)
+    }
+    cloud
+  }, files, selectors)
+  clouds <- Filter(function(x) !is.null(x) && !lidR::is.empty(x), clouds)
+  if (!length(clouds)) return(NULL)
+  if (length(clouds) == 1L) clouds[[1L]] else CspStandSegmentation::las_merge(clouds, fill = TRUE)
+}
+
+chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir) {
+  partial_dir <- file.path(work_dir, "dtm")
+  dir.create(partial_dir, recursive = TRUE)
+  partials <- character()
+  methods <- character()
+  selectors <- rep("c", length(files))
+  for (index in seq_along(chunks)) {
+    core <- chunks[[index]]
+    buffered <- core + c(xmin = -buffer, xmax = buffer, ymin = -buffer, ymax = buffer)
+    las <- read_spatial_chunk(files, selectors, buffered)
+    if (is.null(las)) next
+    result <- tryCatch(make_dtm(las, resolution), error = function(error) NULL)
+    if (is.null(result)) next
+    tile <- tryCatch(
+      terra::crop(result$dtm, terra::ext(core[["xmin"]], core[["xmax"]], core[["ymin"]], core[["ymax"]])),
+      error = function(error) NULL
+    )
+    if (is.null(tile) || terra::ncell(tile) == 0L || all(is.na(terra::values(tile)))) next
+    path <- file.path(partial_dir, sprintf("dtm_%05d.tif", index))
+    terra::writeRaster(tile, path, overwrite = TRUE)
+    partials <- c(partials, path)
+    methods <- c(methods, result$method)
+    rm(las, result, tile)
+    gc(FALSE)
+  }
+  if (!length(partials)) abort("Chunked DTM generation produced no valid cells")
+  dtm <- terra::vrt(partials)
+  output <- file.path(stage_dir, "dtm_full.tif")
+  terra::writeRaster(dtm, output, overwrite = TRUE)
+  list(
+    dtm = terra::rast(output),
+    method = if (all(methods == "classification_2")) "chunked_classification_2" else "chunked_csf",
+    chunk_count = length(chunks)
+  )
+}
+
+update_streaming_hull <- function(hull, x, y) {
+  candidate <- data.table::data.table(x = x, y = y)
+  if (nrow(candidate) > 3L) candidate <- candidate[chull(x, y)]
+  if (!is.null(hull)) candidate <- data.table::rbindlist(list(hull, candidate))
+  if (nrow(candidate) > 3L) candidate <- candidate[chull(x, y)]
+  candidate
+}
+
+append_partition <- function(path, values) {
+  connection <- file(path, open = "ab")
+  on.exit(close(connection))
+  writeBin(as.double(t(as.matrix(values))), connection, size = 8L)
+}
+
+stream_inventory_partitions <- function(files, chunks, specs, config, work_dir) {
+  selectors <- vapply(files, read_selector, character(1), specs = specs, preserve_all_dimensions = FALSE)
+  partition_root <- file.path(work_dir, "partitions")
+  dir.create(partition_root, recursive = TRUE)
+  layouts <- list()
+  for (spec in specs) {
+    slug <- gsub("[^A-Za-z0-9_]+", "_", spec$source)
+    columns <- unique(c(
+      "X", "Y", "Z", spec$instance, spec$species, spec$species_prob,
+      if (identical(spec$source, "FM")) c("PredScore_FM", "PredSemantic_FM")
+    ))
+    columns <- columns[!is.na(columns) & nzchar(columns)]
+    directory <- file.path(partition_root, slug)
+    dir.create(directory)
+    layouts[[slug]] <- list(spec = spec, columns = columns, directory = directory)
+  }
+
+  point_count <- 0
+  hull <- NULL
+  loaded_dimensions <- character()
+  dropped_dimensions <- character()
+  for (core in chunks) {
+    las <- read_spatial_chunk(files, selectors, core, specs)
+    if (is.null(las)) next
+    points <- las@data[
+      X >= core[["xmin"]] & X < core[["xmax"]] &
+        Y >= core[["ymin"]] & Y < core[["ymax"]]
+    ]
+    if (!nrow(points)) next
+    point_count <- point_count + nrow(points)
+    hull <- update_streaming_hull(hull, points$X, points$Y)
+    loaded_dimensions <- union(loaded_dimensions, names(points))
+    dropped_dimensions <- union(dropped_dimensions, attr(las, "dropped_dimensions"))
+
+    for (layout in layouts) {
+      spec <- layout$spec
+      instance <- spec$instance
+      available_columns <- intersect(layout$columns, names(points))
+      selected <- points[
+        !is.na(get(instance)) & is.finite(get(instance)) &
+          get(instance) >= 0 & !(get(instance) %in% config$non_tree_ids),
+        ..available_columns
+      ]
+      if (!nrow(selected)) next
+      missing <- setdiff(layout$columns, names(selected))
+      for (dimension in missing) data.table::set(selected, j = dimension, value = NA_real_)
+      layout_columns <- layout$columns
+      selected <- selected[, ..layout_columns]
+      data.table::set(
+        selected,
+        j = "partition__",
+        value = as.integer(abs(selected[[instance]]) %% config$inventory_partitions) + 1L
+      )
+      for (partition in unique(selected$partition__)) {
+        path <- file.path(layout$directory, sprintf("%05d.bin", partition))
+        partition_columns <- setdiff(names(selected), "partition__")
+        append_partition(path, selected[partition__ == partition, ..partition_columns])
+      }
+    }
+    rm(las, points)
+    gc(FALSE)
+  }
+  list(
+    layouts = layouts,
+    point_count = point_count,
+    hull = hull,
+    loaded_dimensions = loaded_dimensions,
+    dropped_dimensions = dropped_dimensions,
+    selectors = selectors
+  )
+}
+
+read_binary_partition <- function(path, columns) {
+  count <- file.info(path)$size / 8
+  values <- readBin(path, numeric(), n = count, size = 8L)
+  if (length(values) %% length(columns) != 0L) abort(sprintf("Invalid inventory partition: %s", path))
+  data.table::as.data.table(matrix(values, ncol = length(columns), byrow = TRUE, dimnames = list(NULL, columns)))
+}
+
+inventory_from_partitions <- function(stream, dtm, config, aoi, crs) {
+  inventories <- list()
+  for (slug in names(stream$layouts)) {
+    layout <- stream$layouts[[slug]]
+    paths <- sort(list.files(layout$directory, pattern = "\\.bin$", full.names = TRUE))
+    partials <- list()
+    for (path in paths) {
+      points <- read_binary_partition(path, layout$columns)
+      terrain <- terra::extract(dtm, data.frame(X = points$X, Y = points$Y), ID = FALSE)[[1L]]
+      data.table::set(points, j = "Zref", value = points$Z)
+      data.table::set(points, j = "Z", value = points$Z - terrain)
+      points <- points[is.finite(Z)]
+      if (!nrow(points)) next
+      las <- lidR::LAS(as.data.frame(points))
+      partials[[length(partials) + 1L]] <- inventory_for_spec(las, layout$spec, config, aoi, crs)
+      rm(points, las)
+      gc(FALSE)
+    }
+    if (!length(partials)) abort(sprintf("No valid inventory partitions for %s", layout$spec$instance))
+    inventory <- data.table::rbindlist(partials, use.names = TRUE, fill = TRUE)
+    data.table::setorder(inventory, instance_id)
+    attr(inventory, "segmentation_source") <- layout$spec$source
+    attr(inventory, "instance_dimension") <- layout$spec$instance
+    inventories[[slug]] <- inventory
+  }
+  inventories
+}
+
+run_chunked_inventory <- function(config, files, stage_dir, output_parent, started) {
+  work_dir <- tempfile("csp-chunks-", tmpdir = output_parent)
+  dir.create(work_dir)
+  on.exit(unlink(work_dir, recursive = TRUE, force = TRUE), add = TRUE)
+  bounds <- point_cloud_bounds(files)
+  chunks <- spatial_chunks(bounds, config$read_chunk_size)
+  available <- unique(c(
+    "X", "Y", "Z", "Classification",
+    unlist(lapply(bounds$headers, extra_byte_names), use.names = FALSE)
+  ))
+  for (spec in config$segmentation_specs) {
+    required <- c(spec$instance, spec$species, spec$species_prob)
+    missing <- setdiff(required[!is.na(required)], available)
+    if (length(missing)) abort(sprintf("Requested dimensions are missing for %s: %s", spec$instance, paste(missing, collapse = ", ")))
+  }
+  las_crs <- sf::st_crs(bounds$headers[[1L]])
+  aoi <- read_aoi(config$aoi_json, las_crs)
+  dtm_result <- chunked_dtm(files, chunks, config$chunk_buffer, config$dtm_resolution, work_dir, stage_dir)
+  if (!is.null(aoi)) {
+    aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
+    terra::writeRaster(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"), overwrite = TRUE)
+  }
+  stream <- stream_inventory_partitions(files, chunks, config$segmentation_specs, config, work_dir)
+  area <- if (!is.null(aoi)) {
+    list(area_m2 = as.numeric(sf::st_area(aoi)), area_source = "aoi")
+  } else {
+    list(area_m2 = polygon_area(stream$hull$x, stream$hull$y), area_source = "point_cloud_convex_hull")
+  }
+  inventories <- inventory_from_partitions(stream, dtm_result$dtm, config, aoi, las_crs)
+  write_outputs(inventories, area, stage_dir)
+
+  metadata <- list(
+    tool = "3Dtrees: CSP StandSegmentation",
+    package_version = as.character(utils::packageVersion("CspStandSegmentation")),
+    input_files = unname(files), input_bytes = unname(sum(file.info(files)$size)),
+    input_points = stream$point_count, input_dimensions = stream$loaded_dimensions,
+    input_read_selectors = unname(stream$selectors),
+    input_dimensions_dropped = stream$dropped_dimensions,
+    segmentation_dimensions = vapply(config$segmentation_specs, `[[`, character(1), "instance"),
+    species_dimensions_supplied = any(vapply(config$segmentation_specs, function(spec) !is.null(spec$species), logical(1))),
+    csp_enabled = FALSE, csp_seed_count = 0L, csp_unassigned_point_count = 0L,
+    read_mode = "spatial_chunks_and_instance_partitions",
+    read_chunk_size_m = config$read_chunk_size,
+    chunk_buffer_m = config$chunk_buffer,
+    spatial_chunk_count = length(chunks),
+    inventory_partitions = config$inventory_partitions,
+    ground_method = dtm_result$method, dtm_resolution_m = config$dtm_resolution,
+    area_source = area$area_source, area_m2 = area$area_m2,
+    random_seed = config$random_seed, routing_workers = config$routing_workers,
+    geometry_threads = config$geometry_threads, voxel_resolution_m = config$voxel_resolution
+  )
+  jsonlite::write_json(metadata, file.path(stage_dir, "run_metadata.json"), auto_unbox = TRUE, pretty = TRUE, na = "null")
+  completed <- Sys.time()
+  resources <- list(
+    elapsed_seconds = as.numeric(difftime(completed, started, units = "secs")),
+    process_peak_rss_kb = process_peak_rss_kb(), input_bytes = unname(sum(file.info(files)$size)),
+    input_points = stream$point_count, routing_workers = config$routing_workers,
+    geometry_threads = config$geometry_threads,
+    note = "Process-local VmHWM only; container/cgroup telemetry is recorded by benchmark runs."
+  )
+  jsonlite::write_json(resources, file.path(stage_dir, "resource_summary.json"), auto_unbox = TRUE, pretty = TRUE, na = "null")
+  resources
+}
+
 run_tool <- function(config) {
   started <- Sys.time()
   set.seed(config$random_seed)
@@ -426,9 +788,23 @@ run_tool <- function(config) {
   published <- FALSE
   on.exit(if (!published) unlink(stage_dir, recursive = TRUE, force = TRUE), add = TRUE)
 
-  original_las <- read_point_cloud(files)
+  if (!config$enable_csp) {
+    resources <- run_chunked_inventory(config, files, stage_dir, output_parent, started)
+    publish_stage(stage_dir, config$output_dir)
+    published <- TRUE
+    message(sprintf("Completed CSP stand inventory in %.1f seconds", resources$elapsed_seconds))
+    return(invisible(resources))
+  }
+
+  original_las <- read_point_cloud(
+    files,
+    config$segmentation_specs,
+    preserve_all_dimensions = config$enable_csp
+  )
   input_point_count <- nrow(original_las@data)
   input_dimensions <- names(original_las@data)
+  input_read_selectors <- attr(original_las, "read_selectors")
+  input_dimensions_dropped <- attr(original_las, "dropped_dimensions")
   original_data <- if (config$enable_csp) data.table::copy(original_las@data) else NULL
   validate_specs(original_las, config$segmentation_specs)
   las_crs <- sf::st_crs(original_las)
@@ -474,6 +850,8 @@ run_tool <- function(config) {
     input_bytes = unname(sum(file.info(files)$size)),
     input_points = input_point_count,
     input_dimensions = input_dimensions,
+    input_read_selectors = unname(input_read_selectors),
+    input_dimensions_dropped = unname(input_dimensions_dropped),
     segmentation_dimensions = vapply(specs, `[[`, character(1), "instance"),
     species_dimensions_supplied = any(vapply(specs, function(spec) !is.null(spec$species), logical(1))),
     csp_enabled = config$enable_csp,

@@ -67,6 +67,9 @@ usage <- function() {
     "  --seed-file TSV                    X/Y/Z/TreeID table for supplied seeds",
     "  --aoi-json GEOJSON                 Optional AOI in the point-cloud CRS",
     "  --dtm-resolution METRES            DTM cell size (default: 0.2)",
+    "  --read-chunk-size METRES            Inventory-only spatial chunk size (default: 25)",
+    "  --chunk-buffer METRES               DTM chunk buffer (default: 5)",
+    "  --inventory-partitions COUNT        Disk-backed instance partitions (default: 64)",
     "  --random-seed INTEGER              RANSAC seed (default: 42)",
     "",
     "Fine-tuning options:",
@@ -102,6 +105,9 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     seed_file = NULL,
     aoi_json = NULL,
     dtm_resolution = 0.2,
+    read_chunk_size = 25,
+    chunk_buffer = 5,
+    inventory_partitions = 64L,
     random_seed = 42L,
     routing_workers = 1L,
     geometry_threads = 1L,
@@ -145,6 +151,9 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--seed-file") config$seed_file <- value
     else if (key == "--aoi-json") config$aoi_json <- value
     else if (key == "--dtm-resolution") config$dtm_resolution <- parse_number(value, key, 0.001)
+    else if (key == "--read-chunk-size") config$read_chunk_size <- parse_number(value, key, 1)
+    else if (key == "--chunk-buffer") config$chunk_buffer <- parse_number(value, key, 0)
+    else if (key == "--inventory-partitions") config$inventory_partitions <- parse_number(value, key, 1, 4096, TRUE)
     else if (key == "--random-seed") config$random_seed <- parse_number(value, key, 0, .Machine$integer.max, TRUE)
     else if (key == "--routing-workers") config$routing_workers <- parse_number(value, key, 1, 256, TRUE)
     else if (key == "--geometry-threads") config$geometry_threads <- parse_number(value, key, 1, 256, TRUE)

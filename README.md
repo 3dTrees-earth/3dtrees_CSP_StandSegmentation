@@ -3,7 +3,7 @@
 Authors: Julian Frey and Zoe Schindler, University of Freiburg, Chair of Forest Growth and Dendroecology
 
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17294732.svg)](https://doi.org/10.5281/zenodo.17294732)  [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0) [![R-CMD-check](https://github.com/JulFrey/CspStandSegmentation/actions/workflows/r.yml/badge.svg)](https://github.com/JulFrey/CspStandSegmentation/actions/workflows/r.yml)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17294732.svg)](https://doi.org/10.5281/zenodo.17294732)  [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 ## 3Dtrees command-line workflow
 
@@ -12,6 +12,17 @@ CLI and container for the 3Dtrees Galaxy tool. It always creates a DTM and can
 inventory any number of existing instance dimensions. CSP segmentation is
 optional; when enabled, the original points and dimensions are preserved and
 the output gains exactly one `PredInstance_CSP` dimension.
+
+Inventory-only runs avoid loading dimensions that cannot affect the DTM or the
+requested inventories. They retain XYZ, Classification, requested
+instance/species fields, and optional ForestMamba score/semantic fields. CSP
+runs continue to load every dimension because the emitted point cloud must
+preserve them. LASlib can select only the first nine extra-byte records by
+position; when a requested field occurs later, the reader safely falls back to
+all extra bytes, then immediately projects the in-memory cloud back to the
+required fields. The container uses the same pinned `rlas` patch as 3Dtrees
+standardization, so that fallback correctly loads every declared extra byte
+rather than stopping after nine.
 
 ```bash
 Rscript exec/run.R \
@@ -56,6 +67,23 @@ projects only the point attributes required by each requested segmentation and
 skips the full preservation copy when CSP output is disabled. On the local
 5.9-million-point GFZ benchmark these changes reduced tool time from 59.4 to
 41.4 seconds and process peak RSS from 4.85 to 3.19 GiB.
+
+With selective reading and the standardization `rlas` patch, the same GFZ file
+successfully loaded 14 extra-byte attributes and inventoried SAT and FM together
+in 53.7 seconds at 2.14 GiB process peak RSS. Sampled CPU averaged 100.1%,
+confirming that the one-thread default consumes approximately one core. The run
+produced 64 tree rows plus DTM, stand, and species products without creating a
+point-cloud output.
+
+Inventory-only execution now uses two bounded passes: buffered spatial chunks
+produce the DTM, then selected point fields are streamed into disk-backed hash
+partitions by instance ID. Each tree remains complete even when its points span
+spatial chunks. The final 5.9-million-point SAT+FM validation used six 25 m
+chunks and 64 instance partitions: all per-instance point counts matched the
+full-cloud run exactly, peak RSS fell to 1.33 GiB, sampled live memory peaked at
+1.16 GiB, and CPU averaged about one fully utilized core. Runtime increased to
+167.1 seconds because the unindexed LAZ was decoded repeatedly. CSP continues
+to use the full-cloud path to preserve upstream global voxel routing.
 
 Build and run the pinned container with:
 

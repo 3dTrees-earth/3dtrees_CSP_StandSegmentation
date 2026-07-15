@@ -13,7 +13,12 @@ RUN apt-get update \
         libxt-dev \
         curl \
         patch \
+        python3-pip \
     && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --break-system-packages --no-cache-dir --no-deps \
+        laspy==2.6.1 \
+        lazrs==0.8.1
 
 RUN install2.r --error --skipinstalled --ncpus -1 \
         BH \

@@ -32,11 +32,25 @@ stopifnot(
   length(config$segmentation_specs) == 2L,
   identical(config$dtm_resolution, 0.2),
   identical(config$routing_workers, 1L),
-  identical(config$read_chunk_size, 25),
+  identical(config$read_chunk_size, 300),
   identical(config$chunk_buffer, 5),
   identical(config$inventory_partitions, 64L),
+  identical(config$dtm_workers, 10L),
+  identical(config$dtm_strategy, "auto"),
+  identical(config$dtm_candidate_resolution, 0.1),
+  identical(config$dtm_streaming_threshold, 50000000L),
   !config$enable_csp
 )
+
+worker_pids <- unlist(parallel_chunk_map(
+  as.list(seq_len(4L)),
+  workers = 2L,
+  fun = function(value) {
+    Sys.sleep(0.05)
+    Sys.getpid()
+  }
+))
+stopifnot(length(unique(worker_pids)) == 2L)
 
 edge_chunks <- spatial_chunks(list(xmin = 0, xmax = 25, ymin = 0, ymax = 25), 25)
 stopifnot(
@@ -70,6 +84,21 @@ stopifnot(
 expect_error(
   parse_cli_args(c("--input", "input.laz", "--output-dir", "output")),
   "segmentation-spec"
+)
+expect_error(
+  parse_cli_args(c(
+    "--input", "input.laz", "--output-dir", "output",
+    "--segmentation-spec", "PredInstance_SAT", "--dtm-strategy", "invalid"
+  )),
+  "dtm-strategy"
+)
+expect_error(
+  parse_cli_args(c(
+    "--input", "input.laz", "--output-dir", "output",
+    "--segmentation-spec", "PredInstance_SAT", "--dtm-resolution", "0.2",
+    "--dtm-candidate-resolution", "0.3"
+  )),
+  "candidate-resolution"
 )
 expect_error(
   parse_cli_args(c(

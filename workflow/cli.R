@@ -67,8 +67,12 @@ usage <- function() {
     "  --seed-file TSV                    X/Y/Z/TreeID table for supplied seeds",
     "  --aoi-json GEOJSON                 Optional AOI in the point-cloud CRS",
     "  --dtm-resolution METRES            DTM cell size (default: 0.2)",
-    "  --read-chunk-size METRES            Inventory-only spatial chunk size (default: 25)",
+    "  --read-chunk-size METRES            Spatial DTM/inventory tile size (default: 300)",
     "  --chunk-buffer METRES               DTM chunk buffer (default: 5)",
+    "  --dtm-workers INTEGER                Parallel DTM workers (default: 10)",
+    "  --dtm-strategy auto|spatial|streaming DTM read strategy (default: auto)",
+    "  --dtm-candidate-resolution METRES   Streaming low-surface grid (default: 0.1)",
+    "  --dtm-streaming-threshold POINTS    Auto threshold (default: 50000000)",
     "  --inventory-partitions COUNT        Disk-backed instance partitions (default: 64)",
     "  --random-seed INTEGER              RANSAC seed (default: 42)",
     "",
@@ -105,8 +109,12 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     seed_file = NULL,
     aoi_json = NULL,
     dtm_resolution = 0.2,
-    read_chunk_size = 25,
+    read_chunk_size = 300,
     chunk_buffer = 5,
+    dtm_workers = 10L,
+    dtm_strategy = "auto",
+    dtm_candidate_resolution = 0.1,
+    dtm_streaming_threshold = 50000000L,
     inventory_partitions = 64L,
     random_seed = 42L,
     routing_workers = 1L,
@@ -153,6 +161,10 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--dtm-resolution") config$dtm_resolution <- parse_number(value, key, 0.001)
     else if (key == "--read-chunk-size") config$read_chunk_size <- parse_number(value, key, 1)
     else if (key == "--chunk-buffer") config$chunk_buffer <- parse_number(value, key, 0)
+    else if (key == "--dtm-workers") config$dtm_workers <- parse_number(value, key, 1, 256, TRUE)
+    else if (key == "--dtm-strategy") config$dtm_strategy <- value
+    else if (key == "--dtm-candidate-resolution") config$dtm_candidate_resolution <- parse_number(value, key, 0.001)
+    else if (key == "--dtm-streaming-threshold") config$dtm_streaming_threshold <- parse_number(value, key, 1, Inf, TRUE)
     else if (key == "--inventory-partitions") config$inventory_partitions <- parse_number(value, key, 1, 4096, TRUE)
     else if (key == "--random-seed") config$random_seed <- parse_number(value, key, 0, .Machine$integer.max, TRUE)
     else if (key == "--routing-workers") config$routing_workers <- parse_number(value, key, 1, 256, TRUE)
@@ -177,6 +189,12 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
 
   if (is.null(config$input)) abort("--input is required")
   if (is.null(config$output_dir)) abort("--output-dir is required")
+  if (!config$dtm_strategy %in% c("auto", "spatial", "streaming")) {
+    abort("--dtm-strategy must be auto, spatial, or streaming")
+  }
+  if (config$dtm_candidate_resolution > config$dtm_resolution) {
+    abort("--dtm-candidate-resolution may not exceed --dtm-resolution")
+  }
   if (!config$seed_mode %in% c("automatic", "supplied")) abort("--seed-mode must be automatic or supplied")
   if (config$enable_csp && config$seed_mode == "supplied" && is.null(config$seed_file)) {
     abort("--seed-file is required when --seed-mode supplied")

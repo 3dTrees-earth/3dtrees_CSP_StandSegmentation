@@ -555,40 +555,139 @@ read_spatial_chunk <- function(files, selectors, extent, specs = NULL) {
   if (length(clouds) == 1L) clouds[[1L]] else CspStandSegmentation::las_merge(clouds, fill = TRUE)
 }
 
-chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir) {
+parallel_chunk_map <- function(values, workers, fun) {
+  workers <- min(as.integer(workers), length(values))
+  if (workers <= 1L) return(lapply(values, fun))
+  results <- parallel::mclapply(
+    values,
+    fun,
+    mc.cores = workers,
+    mc.preschedule = TRUE,
+    mc.set.seed = FALSE
+  )
+  failed <- vapply(results, inherits, logical(1), what = "try-error")
+  if (any(failed)) {
+    abort(sprintf("Parallel DTM worker failed: %s", as.character(results[[which(failed)[[1L]]]])))
+  }
+  results
+}
+
+chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir, workers = 1L) {
   partial_dir <- file.path(work_dir, "dtm")
   dir.create(partial_dir, recursive = TRUE)
-  partials <- character()
-  methods <- character()
   selectors <- rep("c", length(files))
-  for (index in seq_along(chunks)) {
+  process_chunk <- function(index) {
+    lidR::set_lidr_threads(1L)
     core <- chunks[[index]]
     buffered <- core + c(xmin = -buffer, xmax = buffer, ymin = -buffer, ymax = buffer)
     las <- read_spatial_chunk(files, selectors, buffered)
-    if (is.null(las)) next
-    result <- tryCatch(make_dtm(las, resolution), error = function(error) NULL)
-    if (is.null(result)) next
-    tile <- tryCatch(
-      terra::crop(result$dtm, terra::ext(core[["xmin"]], core[["xmax"]], core[["ymin"]], core[["ymax"]])),
-      error = function(error) NULL
+    if (is.null(las)) return(NULL)
+    if (nrow(las@data) < 3L || length(unique(las@data$X)) < 2L || length(unique(las@data$Y)) < 2L) {
+      return(NULL)
+    }
+    result <- make_dtm(las, resolution)
+    tile <- terra::crop(
+      result$dtm,
+      terra::ext(core[["xmin"]], core[["xmax"]], core[["ymin"]], core[["ymax"]])
     )
-    if (is.null(tile) || terra::ncell(tile) == 0L || all(is.na(terra::values(tile)))) next
+    if (terra::ncell(tile) == 0L || all(is.na(terra::values(tile)))) return(NULL)
     path <- file.path(partial_dir, sprintf("dtm_%05d.tif", index))
     terra::writeRaster(tile, path, overwrite = TRUE)
-    partials <- c(partials, path)
-    methods <- c(methods, result$method)
-    rm(las, result, tile)
-    gc(FALSE)
+    list(path = path, method = result$method, peak_rss_kb = process_peak_rss_kb())
   }
+  results <- parallel_chunk_map(as.list(seq_along(chunks)), workers, process_chunk)
+  results <- Filter(Negate(is.null), results)
+  partials <- vapply(results, `[[`, character(1), "path")
+  methods <- vapply(results, `[[`, character(1), "method")
   if (!length(partials)) abort("Chunked DTM generation produced no valid cells")
   dtm <- terra::vrt(partials)
+  bounds <- point_cloud_bounds(files)
+  target <- terra::ext(
+    floor(bounds$xmin / resolution) * resolution,
+    ceiling(bounds$xmax / resolution) * resolution,
+    floor(bounds$ymin / resolution) * resolution,
+    ceiling(bounds$ymax / resolution) * resolution
+  )
+  dtm <- terra::extend(dtm, target)
   output <- file.path(stage_dir, "dtm_full.tif")
   terra::writeRaster(dtm, output, overwrite = TRUE)
   list(
     dtm = terra::rast(output),
     method = if (all(methods == "classification_2")) "chunked_classification_2" else "chunked_csf",
-    chunk_count = length(chunks)
+    chunk_count = length(chunks),
+    valid_chunk_count = length(partials),
+    workers = min(as.integer(workers), length(chunks)),
+    worker_peak_rss_sum_kb = sum(vapply(results, `[[`, numeric(1), "peak_rss_kb")),
+    worker_peak_rss_max_kb = max(vapply(results, `[[`, numeric(1), "peak_rss_kb"))
   )
+}
+
+header_point_count <- function(header) {
+  value <- header@PHB[["Number of point records"]]
+  if (is.null(value)) abort("LAS header does not declare a point count")
+  as.numeric(value)
+}
+
+streaming_dtm_candidates <- function(files, config, work_dir) {
+  candidate_dir <- file.path(work_dir, "dtm_candidates")
+  root <- if (exists("repository_root", inherits = TRUE)) {
+    get("repository_root", inherits = TRUE)
+  } else {
+    normalizePath(getwd(), mustWork = TRUE)
+  }
+  script <- file.path(root, "workflow", "stream_dtm_candidates.py")
+  if (!file.exists(script)) abort(sprintf("Streaming DTM helper is missing: %s", script))
+  log_path <- file.path(work_dir, "dtm_candidates.log")
+  arguments <- c(
+    unlist(lapply(files, function(path) c("--input", path)), use.names = FALSE),
+    "--output-dir", candidate_dir,
+    "--candidate-resolution", as.character(config$dtm_candidate_resolution),
+    "--output-resolution", as.character(config$dtm_resolution),
+    "--workers", as.character(config$dtm_workers)
+  )
+  status <- system2("python3", c(script, arguments), stdout = log_path, stderr = log_path)
+  if (!identical(status, 0L)) {
+    detail <- if (file.exists(log_path)) paste(tail(readLines(log_path, warn = FALSE), 20L), collapse = "\n") else ""
+    abort(sprintf("Streaming DTM candidate generation failed%s", if (nzchar(detail)) paste0(":\n", detail) else ""))
+  }
+  metadata_path <- file.path(candidate_dir, "candidate_metadata.json")
+  candidate_path <- file.path(candidate_dir, "minimum_candidates.laz")
+  if (!file.exists(metadata_path) || !file.exists(candidate_path)) {
+    abort("Streaming DTM candidate generation did not produce its declared outputs")
+  }
+  list(
+    path = candidate_path,
+    metadata = jsonlite::fromJSON(metadata_path, simplifyVector = TRUE)
+  )
+}
+
+make_inventory_dtm <- function(files, bounds, chunks, config, work_dir, stage_dir) {
+  input_points <- sum(vapply(bounds$headers, header_point_count, numeric(1)))
+  strategy <- config$dtm_strategy
+  if (identical(strategy, "auto")) {
+    strategy <- if (input_points >= config$dtm_streaming_threshold) "streaming" else "spatial"
+  }
+  if (identical(strategy, "spatial")) {
+    result <- chunked_dtm(
+      files, chunks, config$chunk_buffer, config$dtm_resolution,
+      work_dir, stage_dir, config$dtm_workers
+    )
+    result$strategy <- "spatial"
+    result$candidate_metadata <- NULL
+    return(result)
+  }
+
+  candidates <- streaming_dtm_candidates(files, config, work_dir)
+  candidate_bounds <- point_cloud_bounds(candidates$path)
+  candidate_chunks <- spatial_chunks(candidate_bounds, config$read_chunk_size)
+  result <- chunked_dtm(
+    candidates$path, candidate_chunks, config$chunk_buffer,
+    config$dtm_resolution, work_dir, stage_dir, config$dtm_workers
+  )
+  result$method <- paste0("streaming_candidates_", result$method)
+  result$strategy <- "streaming"
+  result$candidate_metadata <- candidates$metadata
+  result
 }
 
 update_streaming_hull <- function(hull, x, y) {
@@ -729,7 +828,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
   }
   las_crs <- sf::st_crs(bounds$headers[[1L]])
   aoi <- read_aoi(config$aoi_json, las_crs)
-  dtm_result <- chunked_dtm(files, chunks, config$chunk_buffer, config$dtm_resolution, work_dir, stage_dir)
+  dtm_result <- make_inventory_dtm(files, bounds, chunks, config, work_dir, stage_dir)
   if (!is.null(aoi)) {
     aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
     terra::writeRaster(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"), overwrite = TRUE)
@@ -757,6 +856,18 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     read_chunk_size_m = config$read_chunk_size,
     chunk_buffer_m = config$chunk_buffer,
     spatial_chunk_count = length(chunks),
+    dtm_workers = dtm_result$workers,
+    dtm_valid_chunk_count = dtm_result$valid_chunk_count,
+    dtm_strategy = dtm_result$strategy,
+    dtm_candidate_resolution_m = if (is.null(dtm_result$candidate_metadata)) NULL else dtm_result$candidate_metadata$candidate_resolution_m,
+    dtm_candidate_xy_mode = if (is.null(dtm_result$candidate_metadata)) NULL else dtm_result$candidate_metadata$candidate_xy_mode,
+    dtm_candidate_points = if (is.null(dtm_result$candidate_metadata)) NULL else dtm_result$candidate_metadata$candidate_points,
+    dtm_candidate_elapsed_seconds = if (is.null(dtm_result$candidate_metadata)) NULL else dtm_result$candidate_metadata$elapsed_seconds,
+    dtm_candidate_average_cpu_cores = if (is.null(dtm_result$candidate_metadata)) NULL else dtm_result$candidate_metadata$average_cpu_cores,
+    dtm_candidate_worker_peak_rss_sum_upper_bound_kb = if (is.null(dtm_result$candidate_metadata)) NULL else dtm_result$candidate_metadata$worker_peak_rss_sum_upper_bound_kb,
+    dtm_candidate_parent_peak_rss_kb = if (is.null(dtm_result$candidate_metadata)) NULL else dtm_result$candidate_metadata$parent_peak_rss_kb,
+    dtm_worker_peak_rss_sum_kb = dtm_result$worker_peak_rss_sum_kb,
+    dtm_worker_peak_rss_max_kb = dtm_result$worker_peak_rss_max_kb,
     inventory_partitions = config$inventory_partitions,
     ground_method = dtm_result$method, dtm_resolution_m = config$dtm_resolution,
     area_source = area$area_source, area_m2 = area$area_m2,

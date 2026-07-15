@@ -43,9 +43,8 @@ composition file is created. Run `Rscript exec/run.R --help` for all controls.
 Common controls are the input, repeatable segmentation specs, non-tree IDs,
 optional CSP and seed source, optional native-CRS AOI GeoJSON, DTM resolution
 (default 0.2 m), and random seed. Fine-tuning controls retain upstream defaults,
-including a 0.3 m CSP voxel and one routing worker. The geometry-thread control
-also caps lidR DTM and normalization work and defaults to one. CSP geometry
-features are computed only when a non-zero geometry weight requires them.
+including a 0.3 m CSP voxel and one routing worker. CSP geometry features are
+computed only when a non-zero geometry weight requires them.
 
 Outputs include:
 
@@ -75,15 +74,35 @@ confirming that the one-thread default consumes approximately one core. The run
 produced 64 tree rows plus DTM, stand, and species products without creating a
 point-cloud output.
 
-Inventory-only execution now uses two bounded passes: buffered spatial chunks
-produce the DTM, then selected point fields are streamed into disk-backed hash
+Inventory-only execution uses two bounded passes. DTM generation defaults to
+300 m tiles with a 5 m buffer and up to 10 workers. Below 50 million points the
+tiles read the source directly. Larger inputs are scanned once in parallel by
+point range, retaining the minimum Z at each deterministic 0.1 m cell centre;
+CSF and TIN rasterization then run on that reduced surface in parallel tiles.
+Each spatial worker uses one lidR thread, avoiding nested oversubscription. The
+result raster retains the aligned input extent, with unsupported edge areas as
+NoData.
+
+The second pass reads only selected inventory fields into disk-backed hash
 partitions by instance ID. Each tree remains complete even when its points span
-spatial chunks. The final 5.9-million-point SAT+FM validation used six 25 m
-chunks and 64 instance partitions: all per-instance point counts matched the
-full-cloud run exactly, peak RSS fell to 1.33 GiB, sampled live memory peaked at
-1.16 GiB, and CPU averaged about one fully utilized core. Runtime increased to
-167.1 seconds because the unindexed LAZ was decoded repeatedly. CSP continues
-to use the full-cloud path to preserve upstream global voxel routing.
+spatial chunks. CSP continues to use the full-cloud path to preserve upstream
+global voxel routing and the optional point-cloud output.
+
+On dataset 2056 (1,141,911,324 points, 3.7 GB compact LAZ), the memory-focused
+streaming candidate stage completed in 56.8 seconds with 10 workers, averaged
+9.51 CPU cores, and retained 1,267,661 candidates. Parent peak RSS was 0.78 GiB
+and the conservative sum of all worker peaks was 6.72 GiB under a 50 GB Docker
+limit. The 300 m + 5 m CSF/TIN stage completed in 76.4 seconds; its conservative
+aggregate worker peak was 2.98 GiB. An earlier exact-coordinate prototype
+scaled from 543.4 seconds with one worker to 306.6 seconds with two, 206.6
+seconds with four, and 127.9 seconds with ten. Replacing per-worker XY grids
+with deterministic cell centres produced the final 56.8-second result and cut
+the conservative 10-worker peak sum from 16.6 GiB to 6.72 GiB.
+
+On the 5.9-million-point GFZ reference, reducing to deterministic 0.1 m cell
+centres before CSF/TIN changed the DTM relative to direct full-cloud CSF/TIN by
+about 9.1 cm RMSE (4.0 cm median absolute difference). Automatic mode therefore
+keeps the direct spatial method for clouds below the 50-million-point threshold.
 
 Build and run the pinned container with:
 

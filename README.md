@@ -5,6 +5,59 @@ Authors: Julian Frey and Zoe Schindler, University of Freiburg, Chair of Forest 
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17294732.svg)](https://doi.org/10.5281/zenodo.17294732)  [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0) [![R-CMD-check](https://github.com/JulFrey/CspStandSegmentation/actions/workflows/r.yml/badge.svg)](https://github.com/JulFrey/CspStandSegmentation/actions/workflows/r.yml)
 
+## 3Dtrees command-line workflow
+
+This fork retains the upstream segmentation implementation and adds a headless
+CLI and container for the 3Dtrees Galaxy tool. It always creates a DTM and can
+inventory any number of existing instance dimensions. CSP segmentation is
+optional; when enabled, the original points and dimensions are preserved and
+the output gains exactly one `PredInstance_CSP` dimension.
+
+```bash
+Rscript exec/run.R \
+  --input input.laz \
+  --output-dir results \
+  --segmentation-spec PredInstance_SAT,species_id_SAT,species_prob_SAT \
+  --segmentation-spec PredInstance_FM,species_id_FM,species_prob_FM \
+  --enable-csp false \
+  --dtm-resolution 0.2 \
+  --random-seed 42
+```
+
+`--segmentation-spec INSTANCE[,SPECIES,SPECIES_PROB]` is repeatable. Species
+dimensions are optional per segmentation but must be supplied as a pair. When
+none are supplied, the combined inventory omits species columns and no species
+composition file is created. Run `Rscript exec/run.R --help` for all controls.
+
+Common controls are the input, repeatable segmentation specs, non-tree IDs,
+optional CSP and seed source, optional native-CRS AOI GeoJSON, DTM resolution
+(default 0.2 m), and random seed. Fine-tuning controls retain upstream defaults,
+including a 0.3 m CSP voxel and one routing worker. The geometry-thread control
+also caps lidR DTM and normalization work and defaults to one. CSP geometry
+features are computed only when a non-zero geometry weight requires them.
+
+Outputs include:
+
+- `dtm_full.tif` and optional `dtm_aoi.tif`;
+- one TSV per instance dimension plus `inventory_combined.tsv`;
+- `stand_summary.tsv` and optional `species_composition.tsv`;
+- `effective_seeds.tsv` and `segmented_csp.laz` only when CSP is enabled;
+- `run_metadata.json` and `resource_summary.json`.
+
+Inventory rows include point count, position, height, DBH, crown convex-hull
+area, and an explicit measurement-quality field. ForestMamba inventories also
+include median `PredScore_FM`, a mixed-score flag, and wood/leaf point counts and
+shares when those source dimensions exist. Processing is fail-atomic: the final
+output directory is published only after all requested products succeed.
+
+Build and run the pinned container with:
+
+```bash
+docker build -t 3dtrees-csp .
+docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
+  Rscript /opt/CspStandSegmentation/exec/run.R --help
+```
+
 
 
 
@@ -161,4 +214,3 @@ BibTex:
 	file = {Full Text PDF:O\:\\Research\\Projects\\Confobi_IWW\\Literatur\\lit_database\\storage\\R7Q8BFU5\\Larysch et al. - 2025 - Quantifying and mapping the ready-to-use veneer volume of European beech trees based on terrestrial.pdf:application/pdf},
 }
 ```
-

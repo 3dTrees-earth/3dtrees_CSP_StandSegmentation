@@ -1,4 +1,5 @@
 .git
+.github
 .Rproj.user
 .Rhistory
 .RData
@@ -14,4 +15,6 @@
 .vscode
 __pycache__
 data/
+tests
 tests/testthat/_snaps/
+inst/extdata

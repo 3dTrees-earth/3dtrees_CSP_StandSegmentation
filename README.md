@@ -50,6 +50,13 @@ include median `PredScore_FM`, a mixed-score flag, and wood/leaf point counts an
 shares when those source dimensions exist. Processing is fail-atomic: the final
 output directory is published only after all requested products succeed.
 
+Existing-instance inventory keeps upstream's 500 RANSAC iterations but uses a
+quiet, vectorized implementation of the same Pratt circle equations. It also
+projects only the point attributes required by each requested segmentation and
+skips the full preservation copy when CSP output is disabled. On the local
+5.9-million-point GFZ benchmark these changes reduced tool time from 59.4 to
+41.4 seconds and process peak RSS from 4.85 to 3.19 GiB.
+
 Build and run the pinned container with:
 
 ```bash

@@ -154,10 +154,16 @@ filter_inventory_to_aoi <- function(inventory, aoi, crs) {
 
 inventory_for_spec <- function(las, spec, config, aoi, crs) {
   instance <- spec$instance
-  points <- data.table::copy(las@data)
-  points <- points[
+  available <- names(las@data)
+  point_columns <- unique(c(
+    "X", "Y", "Z", intersect("Zref", available),
+    instance, spec$species, spec$species_prob,
+    if (identical(spec$source, "FM")) intersect(c("PredScore_FM", "PredSemantic_FM"), available)
+  ))
+  points <- las@data[
     !is.na(get(instance)) & is.finite(get(instance)) &
-      get(instance) >= 0 & !(get(instance) %in% config$non_tree_ids)
+      get(instance) >= 0 & !(get(instance) %in% config$non_tree_ids),
+    ..point_columns
   ]
   if (!nrow(points)) abort(sprintf("No valid instances remain for requested dimension %s", instance))
 
@@ -421,7 +427,9 @@ run_tool <- function(config) {
   on.exit(if (!published) unlink(stage_dir, recursive = TRUE, force = TRUE), add = TRUE)
 
   original_las <- read_point_cloud(files)
-  original_data <- data.table::copy(original_las@data)
+  input_point_count <- nrow(original_las@data)
+  input_dimensions <- names(original_las@data)
+  original_data <- if (config$enable_csp) data.table::copy(original_las@data) else NULL
   validate_specs(original_las, config$segmentation_specs)
   las_crs <- sf::st_crs(original_las)
   aoi <- read_aoi(config$aoi_json, las_crs)
@@ -464,8 +472,8 @@ run_tool <- function(config) {
     package_version = as.character(utils::packageVersion("CspStandSegmentation")),
     input_files = unname(files),
     input_bytes = unname(sum(file.info(files)$size)),
-    input_points = nrow(original_data),
-    input_dimensions = names(original_data),
+    input_points = input_point_count,
+    input_dimensions = input_dimensions,
     segmentation_dimensions = vapply(specs, `[[`, character(1), "instance"),
     species_dimensions_supplied = any(vapply(specs, function(spec) !is.null(spec$species), logical(1))),
     csp_enabled = config$enable_csp,
@@ -486,7 +494,7 @@ run_tool <- function(config) {
     elapsed_seconds = as.numeric(difftime(completed, started, units = "secs")),
     process_peak_rss_kb = process_peak_rss_kb(),
     input_bytes = unname(sum(file.info(files)$size)),
-    input_points = nrow(original_data),
+    input_points = input_point_count,
     routing_workers = config$routing_workers,
     geometry_threads = config$geometry_threads,
     note = "Process-local VmHWM only; container/cgroup telemetry is recorded by benchmark runs."

@@ -45,7 +45,9 @@ jobs:
 
       - uses: r-lib/actions/setup-r-dependencies@v2
         with:
-          extra-packages: rcmdcheck
+          extra-packages: |
+            url::https://cran.r-project.org/src/contrib/Archive/lidR/lidR_4.1.2.tar.gz
+            any::rcmdcheck
 
       - uses: r-lib/actions/check-r-package@v2
 

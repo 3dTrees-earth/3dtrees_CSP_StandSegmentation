@@ -1,0 +1,64 @@
+--- a/src/rlasstreamer.cpp
++++ b/src/rlasstreamer.cpp
+@@ -160,37 +160,42 @@
+   if (unselect.find("-C") != std::string::npos) read_cha(false);
+   if (unselect.find("-W") != std::string::npos) read_W(false);
+ 
+-  std::vector<bool> select_eb(9);
++  std::vector<bool> select_eb(header->number_attributes);
+   std::fill(select_eb.begin(), select_eb.end(), false);
++  auto set_select_eb = [&](size_t index, bool value)
++  {
++    if (index < select_eb.size())
++      select_eb[index] = value;
++  };
+ 
+   if (select.find("0") != std::string::npos)
+     std::fill(select_eb.begin(), select_eb.end(), true);
+   else
+   {
+-    if (select.find("1") != std::string::npos) select_eb[0] = true;
+-    if (select.find("2") != std::string::npos) select_eb[1] = true;
+-    if (select.find("3") != std::string::npos) select_eb[2] = true;
+-    if (select.find("4") != std::string::npos) select_eb[3] = true;
+-    if (select.find("5") != std::string::npos) select_eb[4] = true;
+-    if (select.find("6") != std::string::npos) select_eb[5] = true;
+-    if (select.find("7") != std::string::npos) select_eb[6] = true;
+-    if (select.find("8") != std::string::npos) select_eb[7] = true;
+-    if (select.find("9") != std::string::npos) select_eb[8] = true;
++    if (select.find("1") != std::string::npos) set_select_eb(0, true);
++    if (select.find("2") != std::string::npos) set_select_eb(1, true);
++    if (select.find("3") != std::string::npos) set_select_eb(2, true);
++    if (select.find("4") != std::string::npos) set_select_eb(3, true);
++    if (select.find("5") != std::string::npos) set_select_eb(4, true);
++    if (select.find("6") != std::string::npos) set_select_eb(5, true);
++    if (select.find("7") != std::string::npos) set_select_eb(6, true);
++    if (select.find("8") != std::string::npos) set_select_eb(7, true);
++    if (select.find("9") != std::string::npos) set_select_eb(8, true);
+   }
+ 
+   if (unselect.find("-0") != std::string::npos)
+     std::fill(select_eb.begin(), select_eb.end(), false);
+   else
+   {
+-    if (unselect.find("-1") != std::string::npos) select_eb[0] = false;
+-    if (unselect.find("-2") != std::string::npos) select_eb[1] = false;
+-    if (unselect.find("-3") != std::string::npos) select_eb[2] = false;
+-    if (unselect.find("-4") != std::string::npos) select_eb[3] = false;
+-    if (unselect.find("-5") != std::string::npos) select_eb[4] = false;
+-    if (unselect.find("-6") != std::string::npos) select_eb[5] = false;
+-    if (unselect.find("-7") != std::string::npos) select_eb[6] = false;
+-    if (unselect.find("-8") != std::string::npos) select_eb[7] = false;
+-    if (unselect.find("-9") != std::string::npos) select_eb[8] = false;
++    if (unselect.find("-1") != std::string::npos) set_select_eb(0, false);
++    if (unselect.find("-2") != std::string::npos) set_select_eb(1, false);
++    if (unselect.find("-3") != std::string::npos) set_select_eb(2, false);
++    if (unselect.find("-4") != std::string::npos) set_select_eb(3, false);
++    if (unselect.find("-5") != std::string::npos) set_select_eb(4, false);
++    if (unselect.find("-6") != std::string::npos) set_select_eb(5, false);
++    if (unselect.find("-7") != std::string::npos) set_select_eb(6, false);
++    if (unselect.find("-8") != std::string::npos) set_select_eb(7, false);
++    if (unselect.find("-9") != std::string::npos) set_select_eb(8, false);
+   }
+ 
+   IntegerVector pos_eb;

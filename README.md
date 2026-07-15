@@ -3,7 +3,114 @@
 Authors: Julian Frey and Zoe Schindler, University of Freiburg, Chair of Forest Growth and Dendroecology
 
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17294732.svg)](https://doi.org/10.5281/zenodo.17294732)  [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0) [![R-CMD-check](https://github.com/JulFrey/CspStandSegmentation/actions/workflows/r.yml/badge.svg)](https://github.com/JulFrey/CspStandSegmentation/actions/workflows/r.yml)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17294732.svg)](https://doi.org/10.5281/zenodo.17294732)  [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
+
+## 3Dtrees command-line workflow
+
+This fork retains the upstream segmentation implementation and adds a headless
+CLI and container for the 3Dtrees Galaxy tool. It always creates a DTM and can
+inventory any number of existing instance dimensions. CSP segmentation is
+optional; when enabled, the original points and dimensions are preserved and
+the output gains exactly one `PredInstance_CSP` dimension.
+
+Inventory-only runs avoid loading dimensions that cannot affect the DTM or the
+requested inventories. They retain XYZ, Classification, requested
+instance/species fields, and optional ForestMamba score/semantic fields. CSP
+runs continue to load every dimension because the emitted point cloud must
+preserve them. LASlib can select only the first nine extra-byte records by
+position; when a requested field occurs later, the reader safely falls back to
+all extra bytes, then immediately projects the in-memory cloud back to the
+required fields. The container uses the same pinned `rlas` patch as 3Dtrees
+standardization, so that fallback correctly loads every declared extra byte
+rather than stopping after nine.
+
+```bash
+Rscript exec/run.R \
+  --input input.laz \
+  --output-dir results \
+  --segmentation-spec PredInstance_SAT,species_id_SAT,species_prob_SAT \
+  --segmentation-spec PredInstance_FM,species_id_FM,species_prob_FM \
+  --enable-csp false \
+  --dtm-resolution 0.2 \
+  --random-seed 42
+```
+
+`--segmentation-spec INSTANCE[,SPECIES,SPECIES_PROB]` is repeatable. Species
+dimensions are optional per segmentation but must be supplied as a pair. When
+none are supplied, the combined inventory omits species columns and no species
+composition file is created. Run `Rscript exec/run.R --help` for all controls.
+
+Common controls are the input, repeatable segmentation specs, non-tree IDs,
+optional CSP and seed source, optional native-CRS AOI GeoJSON, DTM resolution
+(default 0.2 m), and random seed. Fine-tuning controls retain upstream defaults,
+including a 0.3 m CSP voxel and one routing worker. CSP geometry features are
+computed only when a non-zero geometry weight requires them.
+
+Outputs include:
+
+- `dtm_full.tif` and optional `dtm_aoi.tif`;
+- one TSV per instance dimension plus `inventory_combined.tsv`;
+- `stand_summary.tsv` and optional `species_composition.tsv`;
+- `effective_seeds.tsv` and `segmented_csp.laz` only when CSP is enabled;
+- `run_metadata.json` and `resource_summary.json`.
+
+Inventory rows include point count, position, height, DBH, crown convex-hull
+area, and an explicit measurement-quality field. ForestMamba inventories also
+include median `PredScore_FM`, a mixed-score flag, and wood/leaf point counts and
+shares when those source dimensions exist. Processing is fail-atomic: the final
+output directory is published only after all requested products succeed.
+
+Existing-instance inventory keeps upstream's 500 RANSAC iterations but uses a
+quiet, vectorized implementation of the same Pratt circle equations. It also
+projects only the point attributes required by each requested segmentation and
+skips the full preservation copy when CSP output is disabled. On the local
+5.9-million-point GFZ benchmark these changes reduced tool time from 59.4 to
+41.4 seconds and process peak RSS from 4.85 to 3.19 GiB.
+
+With selective reading and the standardization `rlas` patch, the same GFZ file
+successfully loaded 14 extra-byte attributes and inventoried SAT and FM together
+in 53.7 seconds at 2.14 GiB process peak RSS. Sampled CPU averaged 100.1%,
+confirming that the one-thread default consumes approximately one core. The run
+produced 64 tree rows plus DTM, stand, and species products without creating a
+point-cloud output.
+
+Inventory-only execution uses two bounded passes. DTM generation defaults to
+300 m tiles with a 5 m buffer and up to 10 workers. Below 50 million points the
+tiles read the source directly. Larger inputs are scanned once in parallel by
+point range, retaining the minimum Z at each deterministic 0.1 m cell centre;
+CSF and TIN rasterization then run on that reduced surface in parallel tiles.
+Each spatial worker uses one lidR thread, avoiding nested oversubscription. The
+result raster retains the aligned input extent, with unsupported edge areas as
+NoData.
+
+The second pass reads only selected inventory fields into disk-backed hash
+partitions by instance ID. Each tree remains complete even when its points span
+spatial chunks. CSP continues to use the full-cloud path to preserve upstream
+global voxel routing and the optional point-cloud output.
+
+On dataset 2056 (1,141,911,324 points, 3.7 GB compact LAZ), the memory-focused
+streaming candidate stage completed in 56.8 seconds with 10 workers, averaged
+9.51 CPU cores, and retained 1,267,661 candidates. Parent peak RSS was 0.78 GiB
+and the conservative sum of all worker peaks was 6.72 GiB under a 50 GB Docker
+limit. The 300 m + 5 m CSF/TIN stage completed in 76.4 seconds; its conservative
+aggregate worker peak was 2.98 GiB. An earlier exact-coordinate prototype
+scaled from 543.4 seconds with one worker to 306.6 seconds with two, 206.6
+seconds with four, and 127.9 seconds with ten. Replacing per-worker XY grids
+with deterministic cell centres produced the final 56.8-second result and cut
+the conservative 10-worker peak sum from 16.6 GiB to 6.72 GiB.
+
+On the 5.9-million-point GFZ reference, reducing to deterministic 0.1 m cell
+centres before CSF/TIN changed the DTM relative to direct full-cloud CSF/TIN by
+about 9.1 cm RMSE (4.0 cm median absolute difference). Automatic mode therefore
+keeps the direct spatial method for clouds below the 50-million-point threshold.
+
+Build and run the pinned container with:
+
+```bash
+docker build -t 3dtrees-csp .
+docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
+  Rscript /opt/CspStandSegmentation/exec/run.R --help
+```
 
 
 
@@ -161,4 +268,3 @@ BibTex:
 	file = {Full Text PDF:O\:\\Research\\Projects\\Confobi_IWW\\Literatur\\lit_database\\storage\\R7Q8BFU5\\Larysch et al. - 2025 - Quantifying and mapping the ready-to-use veneer volume of European beech trees based on terrestrial.pdf:application/pdf},
 }
 ```
-

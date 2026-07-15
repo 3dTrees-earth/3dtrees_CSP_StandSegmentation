@@ -37,6 +37,62 @@ suppress_cat <- function(f, ...) {
   f(...)                        # Call the function and capture its return value
 }
 
+# Quiet, vectorized equivalent of conicfit::CircleFitByPratt(). The upstream
+# implementation emits diagnostics with cat(), which previously required
+# opening and sinking /dev/null for every RANSAC iteration. Forest inventory
+# calls this thousands of times, making output suppression more expensive than
+# the fit itself.
+.circle_fit_by_pratt_quiet <- function(XY) {
+  XY <- as.matrix(XY)
+  centroid <- colMeans(XY)
+  centered <- sweep(XY, 2L, centroid, "-")
+  Xi <- centered[, 1L]
+  Yi <- centered[, 2L]
+  Zi <- Xi * Xi + Yi * Yi
+
+  Mxx <- mean(Xi * Xi)
+  Myy <- mean(Yi * Yi)
+  Mxy <- mean(Xi * Yi)
+  Mxz <- mean(Xi * Zi)
+  Myz <- mean(Yi * Zi)
+  Mzz <- mean(Zi * Zi)
+  Mz <- Mxx + Myy
+  Cov_xy <- Mxx * Myy - Mxy * Mxy
+  Mxz2 <- Mxz * Mxz
+  Myz2 <- Myz * Myz
+  A2 <- 4 * Cov_xy - 3 * Mz * Mz - Mzz
+  A1 <- Mzz * Mz + 4 * Cov_xy * Mz - Mxz2 - Myz2 - Mz * Mz * Mz
+  A0 <- Mxz2 * Myy + Myz2 * Mxx - Mzz * Cov_xy - 2 * Mxz * Myz * Mxy + Mz * Mz * Cov_xy
+  A22 <- A2 + A2
+  epsilon <- 1e-12
+  ynew <- 1e20
+  xnew <- 0
+
+  for (iter in seq_len(20L)) {
+    yold <- ynew
+    ynew <- A0 + xnew * (A1 + xnew * (A2 + xnew * xnew * 4))
+    if (abs(ynew) > abs(yold)) {
+      xnew <- 0
+      break
+    }
+    Dy <- A1 + xnew * (A22 + 16 * xnew * xnew)
+    xold <- xnew
+    xnew <- xold - ynew / Dy
+    if (abs((xnew - xold) / xnew) < epsilon) break
+    if (iter >= 20L || xnew < 0) {
+      xnew <- 0
+      break
+    }
+  }
+
+  DET <- xnew * xnew - xnew * Mz + Cov_xy
+  center <- c(
+    Mxz * (Myy - xnew) - Myz * Mxy,
+    Myz * (Mxx - xnew) - Mxz * Mxy
+  ) / DET / 2
+  matrix(c(center + centroid, sqrt(sum(center * center) + Mz + 2 * xnew)), nrow = 1L)
+}
+
 #' RANSAC circle fitting algorithm specially adapted for tree DBH estimation
 #'
 #' This function fits a circle to a set of points using the RANSAC algorithm it maximizes the points that are in the circle and the number of filled 36 degree angle segments
@@ -87,9 +143,7 @@ ransac_circle_fit <- function(data,n_iterations = 1000L,distance_threshold = 0.0
 
     # Fit circle; keep tryCatch very tight and avoid pipe
     circle <- tryCatch(
-      {
-        CspStandSegmentation::suppress_cat(conicfit::CircleFitByPratt, sample_points)
-      },
+      .circle_fit_by_pratt_quiet(sample_points),
       warning = function(w) NULL,
       error   = function(e) NULL
     )
@@ -536,4 +590,3 @@ plot_inventory <- function(plot, inventory, col = NA, cex = 1.5, label_col = "wh
     rgl::lines3d(c(inventory$X[i] - plot[1], inventory$X[i] - plot[1]), c(inventory$Y[i] - plot[2], inventory$Y[i] - plot[2]), c(inventory$Z[i], inventory$Height[i]), col = ifelse(length(col) >= i, col[i], col), lwd = 2)
   }
 }
-

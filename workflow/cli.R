@@ -225,6 +225,10 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
   config$segmentation_specs <- lapply(repeated, parse_segmentation_spec)
   dimensions <- vapply(config$segmentation_specs, `[[`, character(1), "instance")
   if (anyDuplicated(dimensions)) abort("Each instance dimension may only be supplied once")
+  sources <- vapply(config$segmentation_specs, `[[`, character(1), "source")
+  if (any(!nzchar(sources)) || anyDuplicated(sources)) {
+    abort("Each segmentation must have a distinct, non-empty output source name")
+  }
   if (config$enable_csp && "PredInstance_CSP" %in% dimensions) {
     abort("Do not supply PredInstance_CSP when CSP is enabled; the tool creates it")
   }

@@ -96,6 +96,12 @@ expect_error(
   "segmentation-spec"
 )
 expect_error(
+  parse_cli_args(c("--input", "input.laz", "--output-dir", "output",
+                   "--segmentation-spec", "PredInstance_SAT",
+                   "--segmentation-spec", "SAT")),
+  "distinct"
+)
+expect_error(
   parse_cli_args(c(
     "--input", "input.laz", "--output-dir", "output",
     "--segmentation-spec", "PredInstance_SAT", "--dtm-strategy", "invalid"
@@ -142,5 +148,14 @@ stopifnot(
   abs(fm_one$wood_share - 1 / 3) < 1e-12,
   abs(fm_one$leaf_share - 2 / 3) < 1e-12
 )
+
+header <- lidR::readLASheader(file.path(root, "tests", "tool", "fixtures", "multi-instance.copc.laz"))
+valid_wkt <- header@VLR[["WKT OGC CS"]][["WKT OGC COORDINATE SYSTEM"]]
+header@EVLR[["WKT OGC CS"]] <- header@VLR[["WKT OGC CS"]]
+header@VLR[["WKT OGC CS"]][["WKT OGC COORDINATE SYSTEM"]] <- "COMPD_CS[\"broken\""
+stopifnot(point_cloud_crs(header)$epsg == 32632L)
+header@EVLR[["WKT OGC CS"]][["WKT OGC COORDINATE SYSTEM"]] <- sf::st_crs(32633)$wkt
+header@VLR[["WKT OGC CS"]][["WKT OGC COORDINATE SYSTEM"]] <- valid_wkt
+expect_error(point_cloud_crs(header), "conflicting valid CRS")
 
 cat("tool helper tests passed\n")

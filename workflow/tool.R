@@ -22,6 +22,25 @@ extra_byte_names <- function(header) {
   if (is.null(extra_bytes)) character() else names(extra_bytes)
 }
 
+point_cloud_crs <- function(header) {
+  parse_wkt <- function(records) {
+    wkt <- records[["WKT OGC CS"]][["WKT OGC COORDINATE SYSTEM"]]
+    if (!is.character(wkt) || length(wkt) != 1L || !nzchar(wkt)) return(NULL)
+    tryCatch(suppressWarnings(sf::st_crs(wkt)), error = function(error) NULL)
+  }
+  candidates <- list(
+    tryCatch(suppressWarnings(sf::st_crs(header)), error = function(error) NULL),
+    parse_wkt(header@EVLR),
+    parse_wkt(header@VLR)
+  )
+  valid <- Filter(function(crs) !is.null(crs) && !is.na(crs), candidates)
+  if (!length(valid)) abort("Point cloud has no parseable CRS in its header or WKT records")
+  if (any(vapply(valid[-1L], function(crs) crs != valid[[1L]], logical(1)))) {
+    abort("Point cloud header contains conflicting valid CRS records")
+  }
+  valid[[1L]]
+}
+
 build_read_selector <- function(dimensions, extra_dimensions) {
   standard_codes <- c(
     gpstime = "t", ScanAngle = "a", Intensity = "i",
@@ -121,8 +140,8 @@ load_supplied_dtm <- function(path, source_crs, bounds, stage_dir) {
   dtm <- terra::rast(path)
   if (terra::nlyr(dtm) != 1L) abort("Supplied DTM must have exactly one raster band")
   raster_crs <- sf::st_crs(terra::crs(dtm))
-  if (is.na(source_crs) || is.na(raster_crs) || source_crs != raster_crs) {
-    abort("Supplied DTM and point cloud must have the same valid CRS")
+  if (!same_horizontal_crs(source_crs, raster_crs, bounds)) {
+    abort("Supplied DTM and point cloud must have the same valid CRS or equivalent horizontal CRS")
   }
   if (terra::xmin(dtm) > bounds$xmin || terra::xmax(dtm) < bounds$xmax ||
       terra::ymin(dtm) > bounds$ymin || terra::ymax(dtm) < bounds$ymax) {
@@ -135,6 +154,24 @@ load_supplied_dtm <- function(path, source_crs, bounds, stage_dir) {
     workers = 0L, valid_chunk_count = 0L, candidate_metadata = NULL,
     worker_peak_rss_sum_kb = 0, worker_peak_rss_max_kb = 0
   )
+}
+
+same_horizontal_crs <- function(source_crs, target_crs, bounds, tolerance_m = 0.001) {
+  if (is.na(source_crs) || is.na(target_crs) ||
+      isTRUE(sf::st_is_longlat(source_crs)) || isTRUE(sf::st_is_longlat(target_crs))) return(FALSE)
+  if (source_crs == target_crs) return(TRUE)
+  xy <- rbind(
+    c(bounds$xmin, bounds$ymin), c(bounds$xmax, bounds$ymax),
+    c((bounds$xmin + bounds$xmax) / 2, (bounds$ymin + bounds$ymax) / 2)
+  )
+  points <- sf::st_sfc(lapply(seq_len(nrow(xy)), function(index) sf::st_point(xy[index, ])),
+                       crs = source_crs)
+  transformed <- tryCatch(
+    sf::st_coordinates(suppressWarnings(sf::st_transform(points, target_crs)))[, 1:2, drop = FALSE],
+    error = function(error) NULL
+  )
+  !is.null(transformed) && all(is.finite(transformed)) &&
+    max(abs(transformed - xy)) <= tolerance_m
 }
 
 read_aoi <- function(path, las_crs) {
@@ -511,12 +548,17 @@ publish_stage <- function(stage_dir, output_dir) {
 
 point_cloud_bounds <- function(files) {
   headers <- lapply(files, lidR::readLASheader)
+  crs <- lapply(headers, point_cloud_crs)
+  if (any(vapply(crs[-1L], function(value) value != crs[[1L]], logical(1)))) {
+    abort("Input point-cloud files have different CRS")
+  }
   list(
     xmin = min(vapply(headers, function(x) x@PHB[["Min X"]], numeric(1))),
     xmax = max(vapply(headers, function(x) x@PHB[["Max X"]], numeric(1))),
     ymin = min(vapply(headers, function(x) x@PHB[["Min Y"]], numeric(1))),
     ymax = max(vapply(headers, function(x) x@PHB[["Max Y"]], numeric(1))),
-    headers = headers
+    headers = headers,
+    crs = crs[[1L]]
   )
 }
 
@@ -538,13 +580,15 @@ spatial_chunks <- function(bounds, size) {
   })
 }
 
-read_spatial_chunk <- function(files, selectors, extent, specs = NULL) {
+read_spatial_chunk <- function(files, selectors, extent, specs = NULL, crs = NULL) {
   filter <- sprintf(
     "-keep_xy %.10f %.10f %.10f %.10f",
     extent[["xmin"]], extent[["ymin"]], extent[["xmax"]], extent[["ymax"]]
   )
   clouds <- Map(function(file, select) {
     cloud <- suppressWarnings(lidR::readLAS(file, select = select, filter = filter))
+    if (!is.null(cloud) && !lidR::is.empty(cloud) && !is.null(crs) &&
+        is.na(suppressWarnings(sf::st_crs(cloud)))) sf::st_crs(cloud) <- crs
     if (!is.null(cloud) && !lidR::is.empty(cloud) && !is.null(specs)) {
       cloud <- project_inventory_dimensions(cloud, specs)
     }
@@ -575,12 +619,13 @@ parallel_chunk_map <- function(values, workers, fun) {
 chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir, workers = 1L) {
   partial_dir <- file.path(work_dir, "dtm")
   dir.create(partial_dir, recursive = TRUE)
+  bounds <- point_cloud_bounds(files)
   selectors <- rep("c", length(files))
   process_chunk <- function(index) {
     lidR::set_lidr_threads(1L)
     core <- chunks[[index]]
     buffered <- core + c(xmin = -buffer, xmax = buffer, ymin = -buffer, ymax = buffer)
-    las <- read_spatial_chunk(files, selectors, buffered)
+    las <- read_spatial_chunk(files, selectors, buffered, crs = bounds$crs)
     if (is.null(las)) return(NULL)
     if (nrow(las@data) < 3L || length(unique(las@data$X)) < 2L || length(unique(las@data$Y)) < 2L) {
       return(NULL)
@@ -601,7 +646,6 @@ chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir, 
   methods <- vapply(results, `[[`, character(1), "method")
   if (!length(partials)) abort("Chunked DTM generation produced no valid cells")
   dtm <- terra::vrt(partials)
-  bounds <- point_cloud_bounds(files)
   target <- terra::ext(
     floor(bounds$xmin / resolution) * resolution,
     ceiling(bounds$xmax / resolution) * resolution,
@@ -663,7 +707,7 @@ streaming_dtm_candidates <- function(files, config, work_dir) {
 
 make_inventory_dtm <- function(files, bounds, chunks, config, work_dir, stage_dir) {
   if (!is.null(config$dtm)) {
-    return(load_supplied_dtm(config$dtm, sf::st_crs(bounds$headers[[1L]]), bounds, stage_dir))
+    return(load_supplied_dtm(config$dtm, bounds$crs, bounds, stage_dir))
   }
   input_points <- sum(vapply(bounds$headers, header_point_count, numeric(1)))
   strategy <- config$dtm_strategy
@@ -707,7 +751,7 @@ append_partition <- function(path, values) {
   writeBin(as.double(t(as.matrix(values))), connection, size = 8L)
 }
 
-stream_inventory_partitions <- function(files, chunks, specs, config, work_dir) {
+stream_inventory_partitions <- function(files, chunks, specs, config, work_dir, crs) {
   selectors <- vapply(files, read_selector, character(1), specs = specs, preserve_all_dimensions = FALSE)
   partition_root <- file.path(work_dir, "partitions")
   dir.create(partition_root, recursive = TRUE)
@@ -729,7 +773,7 @@ stream_inventory_partitions <- function(files, chunks, specs, config, work_dir) 
   loaded_dimensions <- character()
   dropped_dimensions <- character()
   for (core in chunks) {
-    las <- read_spatial_chunk(files, selectors, core, specs)
+    las <- read_spatial_chunk(files, selectors, core, specs, crs)
     if (is.null(las)) next
     points <- las@data[
       X >= core[["xmin"]] & X < core[["xmax"]] &
@@ -822,6 +866,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
   dir.create(work_dir)
   on.exit(unlink(work_dir, recursive = TRUE, force = TRUE), add = TRUE)
   bounds <- point_cloud_bounds(files)
+  validate_inventory_crs(bounds$crs)
   chunks <- spatial_chunks(bounds, config$read_chunk_size)
   available <- unique(c(
     "X", "Y", "Z", "Classification",
@@ -832,14 +877,15 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     missing <- setdiff(required[!is.na(required)], available)
     if (length(missing)) abort(sprintf("Requested dimensions are missing for %s: %s", spec$instance, paste(missing, collapse = ", ")))
   }
-  las_crs <- sf::st_crs(bounds$headers[[1L]])
+  las_crs <- bounds$crs
   aoi <- read_aoi(config$aoi_json, las_crs)
   dtm_result <- make_inventory_dtm(files, bounds, chunks, config, work_dir, stage_dir)
   if (!is.null(aoi)) {
     aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
     terra::writeRaster(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"), overwrite = TRUE)
   }
-  stream <- stream_inventory_partitions(files, chunks, config$segmentation_specs, config, work_dir)
+  stream <- stream_inventory_partitions(files, chunks, config$segmentation_specs, config, work_dir,
+                                        las_crs)
   area <- if (!is.null(aoi)) {
     list(area_m2 = as.numeric(sf::st_area(aoi)), area_source = "aoi")
   } else {
@@ -915,18 +961,22 @@ run_tool <- function(config) {
     return(invisible(resources))
   }
 
+  source_crs <- point_cloud_bounds(files)$crs
+  validate_inventory_crs(source_crs)
+
   original_las <- read_point_cloud(
     files,
     config$segmentation_specs,
     preserve_all_dimensions = config$enable_csp
   )
+  if (is.na(sf::st_crs(original_las))) sf::st_crs(original_las) <- source_crs
   input_point_count <- nrow(original_las@data)
   input_dimensions <- names(original_las@data)
   input_read_selectors <- attr(original_las, "read_selectors")
   input_dimensions_dropped <- attr(original_las, "dropped_dimensions")
   original_data <- if (config$enable_csp) data.table::copy(original_las@data) else NULL
   validate_specs(original_las, config$segmentation_specs)
-  las_crs <- sf::st_crs(original_las)
+  las_crs <- source_crs
   aoi <- read_aoi(config$aoi_json, las_crs)
   area <- determine_area(original_las, aoi)
 

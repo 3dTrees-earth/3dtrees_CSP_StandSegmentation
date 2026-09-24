@@ -56,7 +56,8 @@ write_table_format <- function(table, path, format) {
   if (format == "csv") data.table::fwrite(table, path, sep = ",", na = "")
   else if (format == "tsv") data.table::fwrite(table, path, sep = "\t", na = "")
   else if (format == "json") {
-    jsonlite::write_json(as.data.frame(table), path, dataframe = "rows", auto_unbox = TRUE, na = "null", pretty = TRUE)
+    jsonlite::write_json(as.data.frame(table), path, dataframe = "rows", auto_unbox = TRUE,
+                         na = "null", digits = NA, pretty = TRUE)
   } else abort(sprintf("Unsupported table format: %s", format))
 }
 
@@ -165,21 +166,78 @@ write_outputs <- function(inventories, area, stage_dir, config, crs) {
   list(inventories = inventories, tables = tables, artifacts = artifacts, layers = layers)
 }
 
-validate_inventory_manifest <- function(manifest, stage_dir) {
+manifest_scalar <- function(value) {
+  is.character(value) && length(value) == 1L && !is.na(value) && nzchar(value)
+}
+
+validate_inventory_manifest <- function(manifest, stage_dir, expected_dimensions = NULL) {
   if (!identical(manifest$schema_version, inventory_schema_version)) {
     abort("Inventory manifest schema version is invalid")
+  }
+  coordinates <- manifest$coordinate_reference
+  if (!manifest_scalar(coordinates$source_wkt) ||
+      !identical(coordinates$source_xy_units, "m") ||
+      !identical(coordinates$source_z_units, "m") ||
+      !identical(coordinates$longitude_field, "longitude") ||
+      !identical(coordinates$latitude_field, "latitude") ||
+      !identical(as.integer(coordinates$wgs84_epsg), 4326L)) {
+    abort("Inventory manifest has unsafe coordinate metadata")
+  }
+  source_crs <- sf::st_crs(coordinates$source_wkt)
+  validate_inventory_crs(source_crs)
+  if (!is.null(coordinates$source_epsg) &&
+      (length(coordinates$source_epsg) != 1L ||
+       (!is.na(coordinates$source_epsg) && source_crs != sf::st_crs(coordinates$source_epsg)))) {
+    abort("Inventory manifest source EPSG and WKT disagree")
   }
   required_tables <- c("inventory_combined", "species", "stand_summary", "validation", "issues")
   if (!all(required_tables %in% names(manifest$tables)) || !length(manifest$segmentations)) {
     abort("Inventory manifest is missing required tables or segmentations")
   }
+  if (any(vapply(manifest$tables[required_tables], function(table) !length(table$fields), logical(1)))) {
+    abort("Inventory manifest has a table without fields")
+  }
   if (any(vapply(manifest$segmentations, function(spec) {
-    !length(spec$technical_name) || !length(spec$display_name) || !length(spec$fields)
+    !manifest_scalar(spec$technical_name) || !manifest_scalar(spec$display_name) ||
+      !identical(spec$technical_name, spec$potree_instance_dimension) ||
+      !all(c("x", "y", "z", "longitude", "latitude", "dbh_quality_code", "dbh_quality_label") %in%
+           names(spec$fields)) ||
+      !identical(spec$fields$x, "m") || !identical(spec$fields$y, "m") ||
+      !identical(spec$fields$z, "m") || !identical(spec$fields$longitude, "degree") ||
+      !identical(spec$fields$latitude, "degree")
   }, logical(1)))) abort("Inventory manifest has an incomplete segmentation")
+  dimensions <- vapply(manifest$segmentations, `[[`, character(1), "technical_name")
+  if (anyDuplicated(dimensions) ||
+      (!is.null(expected_dimensions) && !setequal(dimensions, expected_dimensions))) {
+    abort("Inventory manifest segmentation dimensions do not match the outputs")
+  }
+  raster <- manifest$dtm
+  dtm_raster <- terra::rast(file.path(stage_dir, "dtm_full.tif"))
+  dtm_bounds <- list(xmin = terra::xmin(dtm_raster), xmax = terra::xmax(dtm_raster),
+                     ymin = terra::ymin(dtm_raster), ymax = terra::ymax(dtm_raster))
+  if (!identical(raster$key, "dtm_full.tif") || !manifest_scalar(raster$source) ||
+      !manifest_scalar(raster$crs_wkt) ||
+      !same_horizontal_crs(source_crs, sf::st_crs(raster$crs_wkt), dtm_bounds) ||
+      length(raster$resolution_m) != 2L || any(!is.finite(raster$resolution_m)) ||
+      any(raster$resolution_m <= 0)) {
+    abort("Inventory manifest DTM metadata is invalid")
+  }
   keys <- vapply(manifest$artifacts, `[[`, character(1), "key")
-  if (anyDuplicated(keys) || any(!file.exists(file.path(stage_dir, keys))) ||
-      !"dtm_full.tif" %in% keys) {
+  actual <- setdiff(list.files(stage_dir, recursive = TRUE), "manifest.json")
+  if (anyDuplicated(keys) || !setequal(keys, actual) ||
+      any(!file.exists(file.path(stage_dir, keys))) || !"dtm_full.tif" %in% keys) {
     abort("Inventory manifest contains duplicate or missing artifact keys")
+  }
+  gpkg <- Filter(function(artifact) identical(artifact$format, "gpkg"), manifest$artifacts)
+  if (length(gpkg)) {
+    layers <- vapply(manifest$segmentations, function(spec) {
+      if (!manifest_scalar(spec$layer)) abort("Inventory manifest is missing a GeoPackage layer")
+      spec$layer
+    }, character(1))
+    if (anyDuplicated(layers) ||
+        !all(c(layers, required_tables) %in% sf::st_layers(file.path(stage_dir, "inventory.gpkg"))$name)) {
+      abort("Inventory manifest GeoPackage layers do not match the output")
+    }
   }
   invisible(manifest)
 }
@@ -221,7 +279,8 @@ write_inventory_manifest <- function(exports, config, crs, dtm, stage_dir) {
     ), lapply(intersect(c("dtm_aoi.tif", "effective_seeds.tsv", "segmented_csp.laz"),
                         list.files(stage_dir)), function(key) list(key = key, format = tools::file_ext(key))))
   )
-  validate_inventory_manifest(manifest, stage_dir)
+  expected_dimensions <- vapply(exports$inventories, function(inventory) unique(inventory$instance_dimension), character(1))
+  validate_inventory_manifest(manifest, stage_dir, expected_dimensions)
   jsonlite::write_json(manifest, file.path(stage_dir, "manifest.json"), auto_unbox = TRUE,
                        pretty = TRUE, na = "null", null = "null")
   invisible(manifest)

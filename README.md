@@ -46,8 +46,12 @@ table is empty. Run `Rscript exec/run.R --help` for all controls.
 Common controls are the merged COPC input, repeatable segmentation specs, non-tree IDs,
 optional CSP and seed source, optional native-CRS AOI GeoJSON, an optional DTM,
 selected output formats, DTM resolution (default 0.2 m when generated), and random seed.
-The source point cloud must declare a projected metre CRS; a supplied DTM must
-use the same CRS and cover the full cloud extent. The supplied DTM is copied to
+The source point cloud must declare a projected metre CRS. The CLI can recover
+the CRS from a valid extended WKT record when a COPC file has a truncated
+ordinary WKT record, and rejects conflicting valid records. A supplied DTM must
+use the same CRS or an equivalent horizontal CRS and cover the full cloud
+extent. When the GeoTIFF omits a vertical datum, its heights must already use
+the point cloud's vertical datum. The supplied DTM is copied to
 `dtm_full.tif` in the output. With no `--dtm`, the tool generates that file.
 Missing DTM cells beneath inventoried points stop the run instead of silently
 dismissing those points.
@@ -67,6 +71,9 @@ combination. Outputs include:
   coordinate metadata, segmentation dimensions, and DTM metadata;
 - `effective_seeds.tsv` and `segmented_csp.laz` only when CSP is enabled;
 - `run_metadata.json` and `resource_summary.json`.
+
+JSON table exports retain double-precision coordinates so the selected formats
+describe the same tree positions.
 
 Inventory rows include source `x`, `y`, `z` and WGS84 `longitude`, `latitude`.
 DBH measurement status uses `dbh_quality_code` and `dbh_quality_label`.
@@ -110,6 +117,16 @@ partitions by instance ID. Each tree remains complete even when its points span
 spatial chunks. CSP continues to use the full-cloud path to preserve upstream
 global voxel routing and the optional point-cloud output.
 
+An offline 15,915,252-point merged COPC run exercised two requested instance
+dimensions under a 10-CPU/50-GB Docker limit. With eight 20 m spatial chunks,
+the supplied-DTM run completed in 283.4 seconds and the generated-DTM run in
+461.6 seconds. Both emitted all four formats and exactly the same 96 FM and 98
+FM2 instance IDs and point counts: 11,049,398 and 11,048,497 assigned points,
+respectively. The generated 0.2 m DTM had 49,289 finite cells. Process peak RSS
+was about 1.45 GiB in both runs; the generated-DTM run recorded a conservative
+9.16 GiB sum of worker peak RSS values. The per-instance inventory pass remains
+serial and dominated the measured runtime.
+
 On dataset 2056 (1,141,911,324 points, 3.7 GB compact LAZ), the memory-focused
 streaming candidate stage completed in 56.8 seconds with 10 workers, averaged
 9.51 CPU cores, and retained 1,267,661 candidates. Parent peak RSS was 0.78 GiB
@@ -133,6 +150,25 @@ current `rlas` and `lidR` source revisions:
 docker build -t 3dtrees-csp .
 docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
   Rscript /opt/CspStandSegmentation/exec/run.R --help
+```
+
+The checked-in `tests/tool/fixtures/multi-instance.copc.laz` contains 29,011
+points and three synthetic instance dimensions. `PredInstance_ULS` is deliberately
+the eleventh extra-byte dimension. Regenerate it in an environment with laspy,
+NumPy, pyproj, and PDAL `writers.copc` support:
+
+```bash
+python tests/tool/generate_multi_instance_copc.py \
+  inst/extdata/beech.las tests/tool/fixtures/multi-instance.copc.laz
+```
+
+The container test exercises those three instance dimensions, every output
+format alone and together, generated and
+supplied DTMs, and both inventory-only and CSP-enabled execution:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
+  Rscript tests/tool/test_end_to_end.R
 ```
 
 

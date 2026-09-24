@@ -10,6 +10,7 @@ script_path <- function() {
 repository_root <- normalizePath(file.path(script_path(), ".."), mustWork = TRUE)
 source(file.path(repository_root, "workflow", "cli.R"))
 source(file.path(repository_root, "workflow", "tool.R"))
+source(file.path(repository_root, "workflow", "outputs.R"))
 
 if ("--version" %in% commandArgs(trailingOnly = TRUE)) {
   description <- read.dcf(file.path(repository_root, "DESCRIPTION"))
@@ -17,7 +18,7 @@ if ("--version" %in% commandArgs(trailingOnly = TRUE)) {
   quit(status = 0L)
 }
 
-required_packages <- c("CspStandSegmentation", "data.table", "jsonlite", "lidR", "sf", "terra")
+required_packages <- c("CspStandSegmentation", "data.table", "jsonlite", "lidR", "sf", "terra", "DBI", "RSQLite")
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages)) {
   abort(sprintf("Missing required R packages: %s", paste(missing_packages, collapse = ", ")))

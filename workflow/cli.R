@@ -25,6 +25,15 @@ parse_non_tree_ids <- function(value) {
   unique(parsed)
 }
 
+parse_output_formats <- function(value) {
+  formats <- unique(tolower(trimws(strsplit(value, ",", fixed = TRUE)[[1L]])))
+  supported <- c("csv", "tsv", "json", "gpkg")
+  if (!length(formats) || any(!formats %in% supported)) {
+    abort("--output-formats must contain csv, tsv, json, and/or gpkg")
+  }
+  formats
+}
+
 validate_dimension <- function(value, label) {
   if (!grepl("^[A-Za-z][A-Za-z0-9_]*$", value)) {
     abort(sprintf("%s is not a valid LAS dimension name: %s", label, value))
@@ -57,7 +66,7 @@ parse_segmentation_spec <- function(value) {
 
 usage <- function() {
   paste(
-    "Usage: run.R --input FILE_OR_DIRECTORY --output-dir DIR [options]",
+    "Usage: run.R --input MERGED.copc.laz --output-dir DIR [options]",
     "",
     "Common options:",
     "  --segmentation-spec INSTANCE[,SPECIES,SPECIES_PROB]  Repeat for each existing segmentation",
@@ -66,6 +75,9 @@ usage <- function() {
     "  --seed-mode automatic|supplied     CSP seed source (default: automatic)",
     "  --seed-file TSV                    X/Y/Z/TreeID table for supplied seeds",
     "  --aoi-json GEOJSON                 Optional AOI in the point-cloud CRS",
+    "  --dtm GEOTIFF                      Use this DTM; otherwise generate one",
+    "  --output-formats LIST              csv,tsv,json,gpkg (default: all four)",
+    "  --species-lookup TSV               Species names and taxonomy/model versions",
     "  --dtm-resolution METRES            DTM cell size (default: 0.2)",
     "  --read-chunk-size METRES            Spatial DTM/inventory tile size (default: 300)",
     "  --chunk-buffer METRES               DTM chunk buffer (default: 5)",
@@ -108,6 +120,9 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     seed_mode = "automatic",
     seed_file = NULL,
     aoi_json = NULL,
+    dtm = NULL,
+    output_formats = c("csv", "tsv", "json", "gpkg"),
+    species_lookup = NULL,
     dtm_resolution = 0.2,
     read_chunk_size = 300,
     chunk_buffer = 5,
@@ -158,6 +173,9 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--seed-mode") config$seed_mode <- value
     else if (key == "--seed-file") config$seed_file <- value
     else if (key == "--aoi-json") config$aoi_json <- value
+    else if (key == "--dtm") config$dtm <- value
+    else if (key == "--output-formats") config$output_formats <- parse_output_formats(value)
+    else if (key == "--species-lookup") config$species_lookup <- value
     else if (key == "--dtm-resolution") config$dtm_resolution <- parse_number(value, key, 0.001)
     else if (key == "--read-chunk-size") config$read_chunk_size <- parse_number(value, key, 1)
     else if (key == "--chunk-buffer") config$chunk_buffer <- parse_number(value, key, 0)

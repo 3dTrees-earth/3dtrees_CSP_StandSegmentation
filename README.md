@@ -8,7 +8,8 @@ Authors: Julian Frey and Zoe Schindler, University of Freiburg, Chair of Forest 
 ## 3Dtrees command-line workflow
 
 This fork retains the upstream segmentation implementation and adds a headless
-CLI and container for the 3Dtrees Galaxy tool. It always creates a DTM and can
+CLI and container for a future 3Dtrees Galaxy tool. It accepts a supplied
+GeoTIFF DTM or generates one and can
 inventory any number of existing instance dimensions. CSP segmentation is
 optional; when enabled, the original points and dimensions are preserved and
 the output gains exactly one `PredInstance_CSP` dimension.
@@ -26,33 +27,54 @@ rather than stopping after nine.
 
 ```bash
 Rscript exec/run.R \
-  --input input.laz \
+  --input merged.copc.laz \
   --output-dir results \
   --segmentation-spec PredInstance_SAT,species_id_SAT,species_prob_SAT \
   --segmentation-spec PredInstance_FM,species_id_FM,species_prob_FM \
   --enable-csp false \
+  --dtm existing_dtm.tif \
+  --output-formats csv,tsv,json,gpkg \
   --dtm-resolution 0.2 \
   --random-seed 42
 ```
 
 `--segmentation-spec INSTANCE[,SPECIES,SPECIES_PROB]` is repeatable. Species
 dimensions are optional per segmentation but must be supplied as a pair. When
-none are supplied, the combined inventory omits species columns and no species
-composition file is created. Run `Rscript exec/run.R --help` for all controls.
+none are supplied, the combined inventory omits species columns and the species
+table is empty. Run `Rscript exec/run.R --help` for all controls.
 
-Common controls are the input, repeatable segmentation specs, non-tree IDs,
-optional CSP and seed source, optional native-CRS AOI GeoJSON, DTM resolution
-(default 0.2 m), and random seed. Fine-tuning controls retain upstream defaults,
+Common controls are the merged COPC input, repeatable segmentation specs, non-tree IDs,
+optional CSP and seed source, optional native-CRS AOI GeoJSON, an optional DTM,
+selected output formats, DTM resolution (default 0.2 m when generated), and random seed.
+The source point cloud must declare a projected metre CRS; a supplied DTM must
+use the same CRS and cover the full cloud extent. The supplied DTM is copied to
+`dtm_full.tif` in the output. With no `--dtm`, the tool generates that file.
+Missing DTM cells beneath inventoried points stop the run instead of silently
+dismissing those points.
+Fine-tuning controls retain upstream defaults,
 including a 0.3 m CSP voxel and one routing worker. CSP geometry features are
 computed only when a non-zero geometry weight requires them.
 
-Outputs include:
+All four table formats are written by default; `--output-formats` can select any
+combination. Outputs include:
 
 - `dtm_full.tif` and optional `dtm_aoi.tif`;
-- one TSV per instance dimension plus `inventory_combined.tsv`;
-- `stand_summary.tsv` and optional `species_composition.tsv`;
+- one CSV, TSV, and/or JSON per instance dimension plus combined Inventory,
+  Species, Stand Summary, Validation, and Issues tables in each selected format;
+- `inventory.gpkg` when selected, with one 3D point layer per segmentation and
+  those five attribute tables;
+- `manifest.json` with version, artifact keys, fields and units, source/WGS84
+  coordinate metadata, segmentation dimensions, and DTM metadata;
 - `effective_seeds.tsv` and `segmented_csp.laz` only when CSP is enabled;
 - `run_metadata.json` and `resource_summary.json`.
+
+Inventory rows include source `x`, `y`, `z` and WGS84 `longitude`, `latitude`.
+DBH measurement status uses `dbh_quality_code` and `dbh_quality_label`.
+If species predictions are present, `--species-lookup lookup.tsv` can add names
+and taxonomy/model versions. The lookup needs `segmentation_source`,
+`species_id`, `scientific_name`, `taxonomy_version`, and `model_version` columns;
+`common_name` is optional. Missing lookup metadata is reported in the Issues
+table without inventing species names.
 
 Inventory rows include point count, position, height, DBH, crown convex-hull
 area, and an explicit measurement-quality field. ForestMamba inventories also
@@ -104,7 +126,8 @@ centres before CSF/TIN changed the DTM relative to direct full-cloud CSF/TIN by
 about 9.1 cm RMSE (4.0 cm median absolute difference). Automatic mode therefore
 keeps the direct spatial method for clouds below the 50-million-point threshold.
 
-Build and run the pinned container with:
+Build and run the container based on Rocker geospatial 4.6.1 with pinned
+current `rlas` and `lidR` source revisions:
 
 ```bash
 docker build -t 3dtrees-csp .
@@ -115,8 +138,12 @@ docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
 
 
 
-## Installation
-We are on CRAN 🎉🥳 you can install the packe in R the simple way:
+## Upstream installation history
+The upstream CRAN package was archived in June 2026 with `lidR`. The container
+above installs pinned source revisions of `rlas` and `lidR`.
+
+The older upstream instructions below are retained for reference and may no
+longer work with current CRAN:
 ```R
 install.packages("CspStandSegmentation")
 ```

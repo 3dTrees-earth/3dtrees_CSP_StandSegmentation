@@ -37,10 +37,20 @@ stopifnot(
   identical(config$inventory_partitions, 64L),
   identical(config$dtm_workers, 10L),
   identical(config$dtm_strategy, "auto"),
+  identical(config$output_formats, c("csv", "tsv", "json", "gpkg")),
   identical(config$dtm_candidate_resolution, 0.1),
   identical(config$dtm_streaming_threshold, 50000000L),
   !config$enable_csp
 )
+
+formats_config <- parse_cli_args(c(
+  "--input", "merged.copc.laz", "--output-dir", "output",
+  "--segmentation-spec", "PredInstance_SAT", "--dtm", "terrain.tif",
+  "--output-formats", "gpkg,json"
+))
+stopifnot(identical(formats_config$dtm, "terrain.tif"),
+          identical(formats_config$output_formats, c("gpkg", "json")))
+expect_error(parse_output_formats("csv,pdf"), "output-formats")
 
 worker_pids <- unlist(parallel_chunk_map(
   as.list(seq_len(4L)),

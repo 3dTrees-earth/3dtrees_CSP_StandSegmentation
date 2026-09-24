@@ -1,6 +1,7 @@
 name: Container
 
 on:
+  pull_request:
   push:
     branches: [main]
     tags: ["v*"]
@@ -17,6 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
+        if: github.event_name != 'pull_request'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -26,12 +28,22 @@ jobs:
         with:
           images: ghcr.io/3dtrees-earth/3dtrees_csp_standsegmentation
           tags: |
-            type=raw,value=0.2.0,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=tag
             type=sha
       - uses: docker/build-push-action@v6
+        id: build
         with:
           context: .
-          push: true
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+      - name: Test PR image
+        if: github.event_name == 'pull_request'
+        env:
+          IMAGE: ${{ steps.build.outputs.imageid }}
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_cli.R
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_outputs.R
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_rlas_extra_bytes.R

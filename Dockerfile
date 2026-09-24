@@ -1,13 +1,15 @@
-FROM rocker/geospatial:4.4.3
+FROM rocker/geospatial:4.6.1
 
 ENV DEBIAN_FRONTEND=noninteractive \
     RGL_USE_NULL=TRUE
 
-ARG RLAS_COMMIT=82cbba42f158d1dfc91efda3207923260a052564
+ARG RLAS_COMMIT=e6af43a84f172d850e4a35e4fcfbca977966191c
+ARG LIDR_COMMIT=b3c67d6d19cfe68e18563ae2a446e7b4bc914d7c
 
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends \
         libgl1-mesa-dev \
+        libglpk40 \
         libglu1-mesa-dev \
         libx11-dev \
         libxt-dev \
@@ -29,15 +31,21 @@ RUN install2.r --error --skipinstalled --ncpus -1 \
         colorspace \
         conicfit \
         data.table \
+        DBI \
         dbscan \
         doParallel \
         foreach \
         geometry \
         igraph \
         jsonlite \
-        lidR \
+        classInt \
+        glue \
+        lazyeval \
         magrittr \
+        parallelly \
         rgl \
+        RSQLite \
+        stars \
         testthat
 
 COPY patches/rlas-read-all-extrabytes.patch /tmp/rlas-read-all-extrabytes.patch
@@ -47,6 +55,12 @@ RUN curl -L -sS "https://github.com/r-lidar/rlas/archive/${RLAS_COMMIT}.tar.gz" 
     && patch -d /tmp/rlas-src -p1 < /tmp/rlas-read-all-extrabytes.patch \
     && R CMD INSTALL /tmp/rlas-src \
     && rm -rf /tmp/rlas-src /tmp/rlas.tar.gz /tmp/rlas-read-all-extrabytes.patch
+
+RUN curl -L -sS "https://github.com/r-lidar/lidR/archive/${LIDR_COMMIT}.tar.gz" -o /tmp/lidR.tar.gz \
+    && mkdir -p /tmp/lidR-src \
+    && tar -xzf /tmp/lidR.tar.gz -C /tmp/lidR-src --strip-components=1 \
+    && R CMD INSTALL /tmp/lidR-src \
+    && rm -rf /tmp/lidR-src /tmp/lidR.tar.gz
 
 WORKDIR /opt/CspStandSegmentation
 COPY . /opt/CspStandSegmentation

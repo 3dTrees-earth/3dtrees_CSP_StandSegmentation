@@ -116,6 +116,27 @@ make_dtm <- function(las, resolution) {
   list(las = grounded, dtm = dtm, method = method)
 }
 
+load_supplied_dtm <- function(path, source_crs, bounds, stage_dir) {
+  if (!file.exists(path) || dir.exists(path)) abort(sprintf("DTM does not exist: %s", path))
+  dtm <- terra::rast(path)
+  if (terra::nlyr(dtm) != 1L) abort("Supplied DTM must have exactly one raster band")
+  raster_crs <- sf::st_crs(terra::crs(dtm))
+  if (is.na(source_crs) || is.na(raster_crs) || source_crs != raster_crs) {
+    abort("Supplied DTM and point cloud must have the same valid CRS")
+  }
+  if (terra::xmin(dtm) > bounds$xmin || terra::xmax(dtm) < bounds$xmax ||
+      terra::ymin(dtm) > bounds$ymin || terra::ymax(dtm) < bounds$ymax) {
+    abort("Supplied DTM must cover the full point-cloud extent")
+  }
+  output <- file.path(stage_dir, "dtm_full.tif")
+  if (!file.copy(path, output, overwrite = TRUE)) abort("Could not stage the supplied DTM")
+  list(
+    las = NULL, dtm = terra::rast(output), method = "supplied", strategy = "supplied",
+    workers = 0L, valid_chunk_count = 0L, candidate_metadata = NULL,
+    worker_peak_rss_sum_kb = 0, worker_peak_rss_max_kb = 0
+  )
+}
+
 read_aoi <- function(path, las_crs) {
   if (is.null(path)) return(NULL)
   if (!file.exists(path)) abort(sprintf("AOI JSON does not exist: %s", path))
@@ -311,9 +332,9 @@ inventory_for_spec <- function(las, spec, config, aoi, crs) {
     dbh_m = DBH,
     height_m = data.table::fcoalesce(Height, fallback_height),
     convex_hull_area_m2 = data.table::fcoalesce(ConvexHullArea, fallback_hull),
-    inventory_quality_code = data.table::fcoalesce(as.integer(quality_flag), 9L)
+    dbh_quality_code = data.table::fcoalesce(as.integer(quality_flag), 9L)
   )]
-  result[, inventory_quality_label := quality_label(inventory_quality_code, dbh_m)]
+  result[, dbh_quality_label := quality_label(dbh_quality_code, dbh_m)]
 
   if (!is.null(spec$species)) {
     species <- species_by_instance(points, spec)
@@ -332,7 +353,7 @@ inventory_for_spec <- function(las, spec, config, aoi, crs) {
     "dbh_m", "height_m", "convex_hull_area_m2", "point_count",
     "species_id", "species_prob", "species_conflict_fraction",
     "pred_score_fm", "pred_score_mixed", "wood_point_count", "leaf_point_count",
-    "wood_share", "leaf_share", "inventory_quality_code", "inventory_quality_label"
+    "wood_share", "leaf_share", "dbh_quality_code", "dbh_quality_label"
   )
   result <- result[, intersect(keep, names(result)), with = FALSE]
   result <- filter_inventory_to_aoi(result, aoi, crs)
@@ -476,27 +497,6 @@ process_peak_rss_kb <- function() {
   line <- grep("^VmHWM:", status, value = TRUE)
   if (!length(line)) return(NA_real_)
   as.numeric(sub("^VmHWM:\\s+([0-9]+).*", "\\1", line[[1L]]))
-}
-
-write_outputs <- function(inventories, area, stage_dir) {
-  inventory_dir <- file.path(stage_dir, "inventories")
-  dir.create(inventory_dir, recursive = TRUE)
-  for (name in names(inventories)) {
-    data.table::fwrite(inventories[[name]], file.path(inventory_dir, paste0(name, ".tsv")), sep = "\t", na = "")
-  }
-  combined <- data.table::rbindlist(inventories, use.names = TRUE, fill = TRUE)
-  has_species <- any(vapply(inventories, function(x) "species_id" %in% names(x), logical(1)))
-  if (!has_species) {
-    species_columns <- intersect(c("species_id", "species_prob", "species_conflict_fraction"), names(combined))
-    if (length(species_columns)) combined[, (species_columns) := NULL]
-  }
-  data.table::fwrite(combined, file.path(stage_dir, "inventory_combined.tsv"), sep = "\t", na = "")
-  summaries <- data.table::rbindlist(lapply(inventories, stand_summary_for_inventory, area = area), fill = TRUE)
-  data.table::fwrite(summaries, file.path(stage_dir, "stand_summary.tsv"), sep = "\t", na = "")
-  composition <- species_composition(inventories)
-  if (!is.null(composition)) {
-    data.table::fwrite(composition, file.path(stage_dir, "species_composition.tsv"), sep = "\t", na = "")
-  }
 }
 
 publish_stage <- function(stage_dir, output_dir) {
@@ -662,6 +662,9 @@ streaming_dtm_candidates <- function(files, config, work_dir) {
 }
 
 make_inventory_dtm <- function(files, bounds, chunks, config, work_dir, stage_dir) {
+  if (!is.null(config$dtm)) {
+    return(load_supplied_dtm(config$dtm, sf::st_crs(bounds$headers[[1L]]), bounds, stage_dir))
+  }
   input_points <- sum(vapply(bounds$headers, header_point_count, numeric(1)))
   strategy <- config$dtm_strategy
   if (identical(strategy, "auto")) {
@@ -792,6 +795,9 @@ inventory_from_partitions <- function(stream, dtm, config, aoi, crs) {
     for (path in paths) {
       points <- read_binary_partition(path, layout$columns)
       terrain <- terra::extract(dtm, data.frame(X = points$X, Y = points$Y), ID = FALSE)[[1L]]
+      if (any(!is.finite(terrain))) {
+        abort("DTM has missing or non-finite cells under inventoried points")
+      }
       data.table::set(points, j = "Zref", value = points$Z)
       data.table::set(points, j = "Z", value = points$Z - terrain)
       points <- points[is.finite(Z)]
@@ -840,7 +846,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     list(area_m2 = polygon_area(stream$hull$x, stream$hull$y), area_source = "point_cloud_convex_hull")
   }
   inventories <- inventory_from_partitions(stream, dtm_result$dtm, config, aoi, las_crs)
-  write_outputs(inventories, area, stage_dir)
+  exports <- write_outputs(inventories, area, stage_dir, config, las_crs)
 
   metadata <- list(
     tool = "3Dtrees: CSP StandSegmentation",
@@ -869,7 +875,8 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     dtm_worker_peak_rss_sum_kb = dtm_result$worker_peak_rss_sum_kb,
     dtm_worker_peak_rss_max_kb = dtm_result$worker_peak_rss_max_kb,
     inventory_partitions = config$inventory_partitions,
-    ground_method = dtm_result$method, dtm_resolution_m = config$dtm_resolution,
+    output_formats = config$output_formats,
+    ground_method = dtm_result$method, dtm_resolution_m = as.numeric(terra::res(dtm_result$dtm)),
     area_source = area$area_source, area_m2 = area$area_m2,
     random_seed = config$random_seed, routing_workers = config$routing_workers,
     geometry_threads = config$geometry_threads, voxel_resolution_m = config$voxel_resolution
@@ -884,6 +891,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     note = "Process-local VmHWM only; container/cgroup telemetry is recorded by benchmark runs."
   )
   jsonlite::write_json(resources, file.path(stage_dir, "resource_summary.json"), auto_unbox = TRUE, pretty = TRUE, na = "null")
+  write_inventory_manifest(exports, config, las_crs, dtm_result, stage_dir)
   resources
 }
 
@@ -922,13 +930,31 @@ run_tool <- function(config) {
   aoi <- read_aoi(config$aoi_json, las_crs)
   area <- determine_area(original_las, aoi)
 
-  dtm_result <- make_dtm(original_las, config$dtm_resolution)
-  terra::writeRaster(dtm_result$dtm, file.path(stage_dir, "dtm_full.tif"), overwrite = TRUE)
+  dtm_result <- if (is.null(config$dtm)) {
+    generated <- make_dtm(original_las, config$dtm_resolution)
+    terra::writeRaster(generated$dtm, file.path(stage_dir, "dtm_full.tif"), overwrite = TRUE)
+    generated
+  } else {
+    load_supplied_dtm(
+      config$dtm, las_crs,
+      list(
+        xmin = min(original_las@data$X), xmax = max(original_las@data$X),
+        ymin = min(original_las@data$Y), ymax = max(original_las@data$Y)
+      ),
+      stage_dir
+    )
+  }
   if (!is.null(aoi)) {
     aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
     terra::writeRaster(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"), overwrite = TRUE)
   }
-  normalized <- lidR::normalize_height(dtm_result$las, lidR::tin(), dtm = dtm_result$dtm)
+  normalized <- lidR::normalize_height(
+    if (is.null(dtm_result$las)) original_las else dtm_result$las,
+    lidR::tin(), dtm = dtm_result$dtm
+  )
+  if (any(!is.finite(normalized@data$Z))) {
+    abort("DTM has missing or non-finite cells under point-cloud points")
+  }
 
   specs <- config$segmentation_specs
   inventory_las <- normalized
@@ -952,7 +978,7 @@ run_tool <- function(config) {
     slug <- gsub("[^A-Za-z0-9_]+", "_", spec$source)
     inventories[[slug]] <- result
   }
-  write_outputs(inventories, area, stage_dir)
+  exports <- write_outputs(inventories, area, stage_dir, config, las_crs)
 
   metadata <- list(
     tool = "3Dtrees: CSP StandSegmentation",
@@ -968,8 +994,9 @@ run_tool <- function(config) {
     csp_enabled = config$enable_csp,
     csp_seed_count = csp_seed_count,
     csp_unassigned_point_count = csp_unassigned_point_count,
+    output_formats = config$output_formats,
     ground_method = dtm_result$method,
-    dtm_resolution_m = config$dtm_resolution,
+    dtm_resolution_m = as.numeric(terra::res(dtm_result$dtm)),
     area_source = area$area_source,
     area_m2 = area$area_m2,
     random_seed = config$random_seed,
@@ -989,6 +1016,7 @@ run_tool <- function(config) {
     note = "Process-local VmHWM only; container/cgroup telemetry is recorded by benchmark runs."
   )
   jsonlite::write_json(resources, file.path(stage_dir, "resource_summary.json"), auto_unbox = TRUE, pretty = TRUE, na = "null")
+  write_inventory_manifest(exports, config, las_crs, dtm_result, stage_dir)
 
   publish_stage(stage_dir, config$output_dir)
   published <- TRUE

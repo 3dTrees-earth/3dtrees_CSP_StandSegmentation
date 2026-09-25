@@ -86,6 +86,8 @@ usage <- function() {
     "  --dtm-candidate-resolution METRES   Streaming low-surface grid (default: 0.1)",
     "  --dtm-streaming-threshold POINTS    Auto threshold (default: 50000000)",
     "  --inventory-partitions COUNT        Disk-backed instance partitions (default: 64)",
+    "  --inventory-read-mode spatial|sequential  COPC inventory scan (default: spatial)",
+    "  --inventory-workers INTEGER         Parallel instance partitions (default: 1)",
     "  --random-seed INTEGER              RANSAC seed (default: 42)",
     "",
     "Fine-tuning options:",
@@ -131,6 +133,8 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     dtm_candidate_resolution = 0.1,
     dtm_streaming_threshold = 50000000L,
     inventory_partitions = 64L,
+    inventory_read_mode = "spatial",
+    inventory_workers = 1L,
     random_seed = 42L,
     routing_workers = 1L,
     geometry_threads = 1L,
@@ -184,6 +188,8 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--dtm-candidate-resolution") config$dtm_candidate_resolution <- parse_number(value, key, 0.001)
     else if (key == "--dtm-streaming-threshold") config$dtm_streaming_threshold <- parse_number(value, key, 1, Inf, TRUE)
     else if (key == "--inventory-partitions") config$inventory_partitions <- parse_number(value, key, 1, 4096, TRUE)
+    else if (key == "--inventory-read-mode") config$inventory_read_mode <- value
+    else if (key == "--inventory-workers") config$inventory_workers <- parse_number(value, key, 1, 20, TRUE)
     else if (key == "--random-seed") config$random_seed <- parse_number(value, key, 0, .Machine$integer.max, TRUE)
     else if (key == "--routing-workers") config$routing_workers <- parse_number(value, key, 1, 256, TRUE)
     else if (key == "--geometry-threads") config$geometry_threads <- parse_number(value, key, 1, 256, TRUE)
@@ -209,6 +215,9 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
   if (is.null(config$output_dir)) abort("--output-dir is required")
   if (!config$dtm_strategy %in% c("auto", "spatial", "streaming")) {
     abort("--dtm-strategy must be auto, spatial, or streaming")
+  }
+  if (!config$inventory_read_mode %in% c("spatial", "sequential")) {
+    abort("--inventory-read-mode must be spatial or sequential")
   }
   if (config$dtm_candidate_resolution > config$dtm_resolution) {
     abort("--dtm-candidate-resolution may not exceed --dtm-resolution")

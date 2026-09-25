@@ -44,7 +44,8 @@ dimensions <- c(SAT = "PredInstance_SAT", FM = "PredInstance_FM", ULS = "PredIns
 formats <- c("csv", "tsv", "json", "gpkg")
 tables <- c("inventory_combined", "species", "stand_summary", "validation", "issues")
 
-run_case <- function(label, mode, selected, csp = FALSE, chunk_size = 300) {
+run_case <- function(label, mode, selected, csp = FALSE, chunk_size = 300,
+                     inventory_read_mode = "spatial") {
   output <- file.path(work, label)
   log <- file.path(work, paste0(label, ".log"))
   args <- c(runner, "--input", input, "--output-dir", output,
@@ -52,6 +53,7 @@ run_case <- function(label, mode, selected, csp = FALSE, chunk_size = 300) {
             "--species-lookup", lookup_path,
             "--output-formats", paste(selected, collapse = ","),
             "--read-chunk-size", as.character(chunk_size),
+            "--inventory-read-mode", inventory_read_mode,
             "--dtm-workers", "1")
   if (mode == "supplied") args <- c(args, "--dtm", dtm_path)
   if (csp) args <- c(args, "--enable-csp", "true")
@@ -218,5 +220,22 @@ for (mode in c("supplied", "generated")) {
   check_case(output, mode, formats, csp = TRUE)
   cat(sprintf("passed %s\n", label))
 }
+
+# Both readers must feed the same point order into the serial inventory so
+# requesting the faster COPC scan cannot change stochastic DBH measurements.
+spatial <- run_case("ordered-spatial", "supplied", formats, chunk_size = 10)
+sequential <- run_case("ordered-sequential", "supplied", formats, chunk_size = 10,
+                       inventory_read_mode = "sequential")
+sequential_metadata <- jsonlite::fromJSON(file.path(sequential, "run_metadata.json"))
+stopifnot(sequential_metadata$read_chunk_size_m == 10,
+          sequential_metadata$spatial_bucket_count > 0)
+data_files <- c(
+  file.path("inventories", paste0(names(dimensions), ".csv")),
+  paste0(tables, ".csv")
+)
+stopifnot(all(vapply(data_files, function(name) {
+  identical(unname(tools::md5sum(file.path(spatial, name))),
+            unname(tools::md5sum(file.path(sequential, name))))
+}, logical(1))))
 
 cat("multi-instance COPC end-to-end tests passed\n")

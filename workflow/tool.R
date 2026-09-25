@@ -751,10 +751,9 @@ append_partition <- function(path, values) {
   writeBin(as.double(t(as.matrix(values))), connection, size = 8L)
 }
 
-stream_inventory_partitions <- function(files, chunks, specs, config, work_dir, crs) {
-  selectors <- vapply(files, read_selector, character(1), specs = specs, preserve_all_dimensions = FALSE)
+partition_layouts <- function(specs, work_dir, create_directories = TRUE) {
   partition_root <- file.path(work_dir, "partitions")
-  dir.create(partition_root, recursive = TRUE)
+  if (create_directories) dir.create(partition_root, recursive = TRUE)
   layouts <- list()
   for (spec in specs) {
     slug <- gsub("[^A-Za-z0-9_]+", "_", spec$source)
@@ -764,16 +763,27 @@ stream_inventory_partitions <- function(files, chunks, specs, config, work_dir, 
     ))
     columns <- columns[!is.na(columns) & nzchar(columns)]
     directory <- file.path(partition_root, slug)
-    dir.create(directory)
+    if (create_directories) dir.create(directory)
     layouts[[slug]] <- list(spec = spec, columns = columns, directory = directory)
   }
+  layouts
+}
+
+stream_inventory_partitions <- function(files, chunks, specs, config, work_dir, crs) {
+  selectors <- vapply(files, read_selector, character(1), specs = specs, preserve_all_dimensions = FALSE)
+  layouts <- partition_layouts(specs, work_dir)
 
   point_count <- 0
   hull <- NULL
   loaded_dimensions <- character()
   dropped_dimensions <- character()
-  for (core in chunks) {
+  spatial_read_seconds <- 0
+  partition_write_seconds <- 0
+  for (chunk_index in seq_along(chunks)) {
+    core <- chunks[[chunk_index]]
+    read_started <- Sys.time()
     las <- read_spatial_chunk(files, selectors, core, specs, crs)
+    spatial_read_seconds <- spatial_read_seconds + as.numeric(difftime(Sys.time(), read_started, units = "secs"))
     if (is.null(las)) next
     points <- las@data[
       X >= core[["xmin"]] & X < core[["xmax"]] &
@@ -785,6 +795,7 @@ stream_inventory_partitions <- function(files, chunks, specs, config, work_dir, 
     loaded_dimensions <- union(loaded_dimensions, names(points))
     dropped_dimensions <- union(dropped_dimensions, attr(las, "dropped_dimensions"))
 
+    write_started <- Sys.time()
     for (layout in layouts) {
       spec <- layout$spec
       instance <- spec$instance
@@ -810,6 +821,9 @@ stream_inventory_partitions <- function(files, chunks, specs, config, work_dir, 
         append_partition(path, selected[partition__ == partition, ..partition_columns])
       }
     }
+    partition_write_seconds <- partition_write_seconds + as.numeric(difftime(Sys.time(), write_started, units = "secs"))
+    message(sprintf("CSP workflow: partitioned chunk %d/%d (%d points)",
+                    chunk_index, length(chunks), nrow(points)))
     rm(las, points)
     gc(FALSE)
   }
@@ -819,7 +833,72 @@ stream_inventory_partitions <- function(files, chunks, specs, config, work_dir, 
     hull = hull,
     loaded_dimensions = loaded_dimensions,
     dropped_dimensions = dropped_dimensions,
-    selectors = selectors
+    selectors = selectors,
+    spatial_read_seconds = spatial_read_seconds,
+    partition_write_seconds = partition_write_seconds
+  )
+}
+
+stream_inventory_partitions_python <- function(files, chunks, specs, config, work_dir) {
+  if (length(files) != 1L) abort("Sequential inventory requires exactly one merged COPC file")
+  layouts <- partition_layouts(specs, work_dir, create_directories = FALSE)
+  script <- file.path(repository_root, "workflow", "stream_inventory_partitions.py")
+  xy_path <- file.path(work_dir, "all_points_xy.bin")
+  config_path <- file.path(work_dir, "sequential_config.json")
+  metadata_path <- file.path(work_dir, "sequential_metadata.json")
+  log_path <- file.path(work_dir, "sequential.log")
+  helper_config <- list(
+    input = files[[1L]], output_dir = file.path(work_dir, "partitions"),
+    xy_path = xy_path, partitions = config$inventory_partitions,
+    chunk_points = 1000000L, non_tree_ids = as.numeric(config$non_tree_ids),
+    spatial_grid = list(
+      xmin = min(vapply(chunks, `[[`, numeric(1), "xmin")),
+      ymin = min(vapply(chunks, `[[`, numeric(1), "ymin")),
+      size = config$read_chunk_size,
+      nx = length(unique(vapply(chunks, `[[`, numeric(1), "xmin"))),
+      ny = length(unique(vapply(chunks, `[[`, numeric(1), "ymin")))
+    ),
+    layouts = lapply(names(layouts), function(slug) list(
+      slug = slug, instance = layouts[[slug]]$spec$instance,
+      columns = layouts[[slug]]$columns
+    ))
+  )
+  jsonlite::write_json(helper_config, config_path, auto_unbox = TRUE, pretty = TRUE, na = "null")
+  status <- system2("python3", c(script, "--config", config_path, "--metadata", metadata_path),
+                    stdout = log_path, stderr = log_path)
+  if (!identical(status, 0L) || !file.exists(metadata_path)) {
+    detail <- if (file.exists(log_path)) paste(tail(readLines(log_path, warn = FALSE), 20L), collapse = "\n") else ""
+    abort(sprintf("Sequential COPC inventory scan failed%s",
+                  if (nzchar(detail)) paste0(":\n", detail) else ""))
+  }
+  metadata <- jsonlite::fromJSON(metadata_path, simplifyVector = TRUE)
+  hull_started <- Sys.time()
+  hull <- NULL
+  connection <- file(xy_path, "rb")
+  on.exit(close(connection), add = TRUE)
+  repeat {
+    values <- readBin(connection, numeric(), n = 2000000L, size = 8L, endian = "little")
+    if (!length(values)) break
+    if (length(values) %% 2L != 0L) abort("Sequential XY spool has a partial coordinate")
+    xy <- matrix(values, ncol = 2L, byrow = TRUE)
+    hull <- update_streaming_hull(hull, xy[, 1L], xy[, 2L])
+  }
+  hull_elapsed_seconds <- as.numeric(difftime(Sys.time(), hull_started, units = "secs"))
+  close(connection)
+  on.exit(NULL, add = FALSE)
+  unlink(xy_path)
+  list(
+    layouts = layouts, point_count = metadata$input_points, hull = hull,
+    loaded_dimensions = metadata$loaded_dimensions,
+    dropped_dimensions = metadata$dropped_dimensions,
+    selectors = stats::setNames("python_sequential_all", basename(files)),
+    spatial_read_seconds = metadata$input_read_seconds,
+    partition_write_seconds = metadata$partition_write_seconds,
+    hull_elapsed_seconds = hull_elapsed_seconds,
+    xy_spool_bytes = metadata$xy_spool_bytes,
+    spatial_bucket_bytes = metadata$spatial_bucket_bytes,
+    sequential_elapsed_seconds = metadata$elapsed_seconds,
+    sequential_peak_rss_kb = metadata$process_peak_rss_kb
   )
 }
 
@@ -835,22 +914,52 @@ inventory_from_partitions <- function(stream, dtm, config, aoi, crs) {
   for (slug in names(stream$layouts)) {
     layout <- stream$layouts[[slug]]
     paths <- sort(list.files(layout$directory, pattern = "\\.bin$", full.names = TRUE))
-    partials <- list()
-    for (path in paths) {
+    workers <- min(config$inventory_workers, length(paths))
+    use_parallel <- workers > 1L
+    if (use_parallel) {
+      dtm_source <- terra::sources(dtm)
+      if (length(dtm_source) != 1L || !file.exists(dtm_source)) {
+        abort("Parallel inventory requires a file-backed DTM")
+      }
+    }
+    process_partition <- function(index) {
+      path <- paths[[index]]
+      local_dtm <- dtm
+      if (use_parallel) {
+        # Parallel scheduling has no shared random stream. Keep its per-partition
+        # stream repeatable; the one-worker default retains upstream seed order.
+        set.seed(as.integer((as.double(config$random_seed) + index) %% .Machine$integer.max))
+        # Each worker opens its own raster handle after the fork.
+        local_dtm <- terra::rast(dtm_source)
+        lidR::set_lidr_threads(1L)
+      }
       points <- read_binary_partition(path, layout$columns)
-      terrain <- terra::extract(dtm, data.frame(X = points$X, Y = points$Y), ID = FALSE)[[1L]]
+      terrain <- terra::extract(local_dtm, data.frame(X = points$X, Y = points$Y), ID = FALSE)[[1L]]
       if (any(!is.finite(terrain))) {
         abort("DTM has missing or non-finite cells under inventoried points")
       }
       data.table::set(points, j = "Zref", value = points$Z)
       data.table::set(points, j = "Z", value = points$Z - terrain)
       points <- points[is.finite(Z)]
-      if (!nrow(points)) next
+      if (!nrow(points)) return(list(empty = TRUE, inventory = NULL))
       las <- lidR::LAS(as.data.frame(points))
-      partials[[length(partials) + 1L]] <- inventory_for_spec(las, layout$spec, config, aoi, crs)
+      result <- inventory_for_spec(las, layout$spec, config, aoi, crs)
       rm(points, las)
       gc(FALSE)
+      list(empty = FALSE, inventory = result)
     }
+    partials <- if (use_parallel) {
+      parallel::mclapply(seq_along(paths), process_partition, mc.cores = workers,
+                         mc.preschedule = TRUE, mc.set.seed = FALSE)
+    } else {
+      lapply(seq_along(paths), process_partition)
+    }
+    failed <- which(vapply(partials, function(result) is.null(result) || inherits(result, "try-error"), logical(1)))
+    if (length(failed)) {
+      abort(sprintf("Inventory worker failed for %s partition %s", layout$spec$instance,
+                    basename(paths[[failed[[1L]]]])))
+    }
+    partials <- lapply(Filter(function(result) !result$empty, partials), `[[`, "inventory")
     if (!length(partials)) abort(sprintf("No valid inventory partitions for %s", layout$spec$instance))
     inventory <- data.table::rbindlist(partials, use.names = TRUE, fill = TRUE)
     data.table::setorder(inventory, instance_id)
@@ -879,20 +988,39 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
   }
   las_crs <- bounds$crs
   aoi <- read_aoi(config$aoi_json, las_crs)
+  message(sprintf("CSP workflow: %d spatial chunks; preparing DTM", length(chunks)))
+  dtm_started <- Sys.time()
   dtm_result <- make_inventory_dtm(files, bounds, chunks, config, work_dir, stage_dir)
   if (!is.null(aoi)) {
     aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
     terra::writeRaster(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"), overwrite = TRUE)
   }
-  stream <- stream_inventory_partitions(files, chunks, config$segmentation_specs, config, work_dir,
-                                        las_crs)
+  dtm_elapsed_seconds <- as.numeric(difftime(Sys.time(), dtm_started, units = "secs"))
+  message(sprintf("CSP workflow: DTM ready in %.1f s; partitioning inventory", dtm_elapsed_seconds))
+  partition_started <- Sys.time()
+  stream <- if (identical(config$inventory_read_mode, "sequential")) {
+    stream_inventory_partitions_python(files, chunks, config$segmentation_specs, config, work_dir)
+  } else {
+    stream_inventory_partitions(files, chunks, config$segmentation_specs, config, work_dir, las_crs)
+  }
+  partition_elapsed_seconds <- as.numeric(difftime(Sys.time(), partition_started, units = "secs"))
+  message(sprintf("CSP workflow: partitions ready in %.1f s; computing inventory", partition_elapsed_seconds))
+  partition_files <- unlist(lapply(stream$layouts, function(layout) {
+    list.files(layout$directory, pattern = "\\.bin$", full.names = TRUE)
+  }), use.names = FALSE)
+  partition_sizes <- file.info(partition_files)$size
   area <- if (!is.null(aoi)) {
     list(area_m2 = as.numeric(sf::st_area(aoi)), area_source = "aoi")
   } else {
     list(area_m2 = polygon_area(stream$hull$x, stream$hull$y), area_source = "point_cloud_convex_hull")
   }
+  inventory_started <- Sys.time()
   inventories <- inventory_from_partitions(stream, dtm_result$dtm, config, aoi, las_crs)
+  inventory_elapsed_seconds <- as.numeric(difftime(Sys.time(), inventory_started, units = "secs"))
+  message(sprintf("CSP workflow: inventory ready in %.1f s; exporting", inventory_elapsed_seconds))
+  export_started <- Sys.time()
   exports <- write_outputs(inventories, area, stage_dir, config, las_crs)
+  export_elapsed_seconds <- as.numeric(difftime(Sys.time(), export_started, units = "secs"))
 
   metadata <- list(
     tool = "3Dtrees: CSP StandSegmentation",
@@ -904,10 +1032,25 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     segmentation_dimensions = vapply(config$segmentation_specs, `[[`, character(1), "instance"),
     species_dimensions_supplied = any(vapply(config$segmentation_specs, function(spec) !is.null(spec$species), logical(1))),
     csp_enabled = FALSE, csp_seed_count = 0L, csp_unassigned_point_count = 0L,
-    read_mode = "spatial_chunks_and_instance_partitions",
+    read_mode = if (identical(config$inventory_read_mode, "sequential"))
+      "sequential_copc_and_instance_partitions" else "spatial_chunks_and_instance_partitions",
     read_chunk_size_m = config$read_chunk_size,
     chunk_buffer_m = config$chunk_buffer,
-    spatial_chunk_count = length(chunks),
+    spatial_chunk_count = if (identical(config$inventory_read_mode, "sequential")) 0L else length(chunks),
+    spatial_bucket_count = if (identical(config$inventory_read_mode, "sequential")) length(chunks) else 0L,
+    dtm_elapsed_seconds = dtm_elapsed_seconds,
+    partition_elapsed_seconds = partition_elapsed_seconds,
+    spatial_read_seconds = stream$spatial_read_seconds,
+    partition_write_seconds = stream$partition_write_seconds,
+    hull_elapsed_seconds = stream$hull_elapsed_seconds,
+    xy_spool_bytes = stream$xy_spool_bytes,
+    spatial_bucket_bytes = stream$spatial_bucket_bytes,
+    sequential_scan_elapsed_seconds = stream$sequential_elapsed_seconds,
+    sequential_scan_peak_rss_kb = stream$sequential_peak_rss_kb,
+    partition_bytes = sum(partition_sizes),
+    largest_partition_bytes = if (length(partition_sizes)) max(partition_sizes) else 0,
+    inventory_elapsed_seconds = inventory_elapsed_seconds,
+    export_elapsed_seconds = export_elapsed_seconds,
     dtm_workers = dtm_result$workers,
     dtm_valid_chunk_count = dtm_result$valid_chunk_count,
     dtm_strategy = dtm_result$strategy,
@@ -921,6 +1064,9 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     dtm_worker_peak_rss_sum_kb = dtm_result$worker_peak_rss_sum_kb,
     dtm_worker_peak_rss_max_kb = dtm_result$worker_peak_rss_max_kb,
     inventory_partitions = config$inventory_partitions,
+    inventory_workers = config$inventory_workers,
+    inventory_seed_policy = if (config$inventory_workers > 1L)
+      "base_seed_plus_partition_index" else "sequential_stream",
     output_formats = config$output_formats,
     ground_method = dtm_result$method, dtm_resolution_m = as.numeric(terra::res(dtm_result$dtm)),
     area_source = area$area_source, area_m2 = area$area_m2,
@@ -933,6 +1079,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     elapsed_seconds = as.numeric(difftime(completed, started, units = "secs")),
     process_peak_rss_kb = process_peak_rss_kb(), input_bytes = unname(sum(file.info(files)$size)),
     input_points = stream$point_count, routing_workers = config$routing_workers,
+    inventory_workers = config$inventory_workers,
     geometry_threads = config$geometry_threads,
     note = "Process-local VmHWM only; container/cgroup telemetry is recorded by benchmark runs."
   )

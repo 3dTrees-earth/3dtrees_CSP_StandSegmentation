@@ -35,6 +35,8 @@ stopifnot(
   identical(config$read_chunk_size, 300),
   identical(config$chunk_buffer, 5),
   identical(config$inventory_partitions, 64L),
+  identical(config$inventory_read_mode, "spatial"),
+  identical(config$inventory_workers, 1L),
   identical(config$dtm_workers, 10L),
   identical(config$dtm_strategy, "auto"),
   identical(config$output_formats, c("csv", "tsv", "json", "gpkg")),
@@ -108,6 +110,18 @@ expect_error(
   )),
   "dtm-strategy"
 )
+stopifnot(identical(parse_cli_args(c(
+  "--input", "input.laz", "--output-dir", "output",
+  "--segmentation-spec", "PredInstance_SAT", "--inventory-workers", "4"
+))$inventory_workers, 4L))
+expect_error(parse_cli_args(c(
+  "--input", "input.laz", "--output-dir", "output",
+  "--segmentation-spec", "PredInstance_SAT", "--inventory-workers", "21"
+)), "inventory-workers")
+expect_error(parse_cli_args(c(
+  "--input", "input.laz", "--output-dir", "output",
+  "--segmentation-spec", "PredInstance_SAT", "--inventory-read-mode", "invalid"
+)), "inventory-read-mode")
 expect_error(
   parse_cli_args(c(
     "--input", "input.laz", "--output-dir", "output",

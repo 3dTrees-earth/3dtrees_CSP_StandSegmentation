@@ -117,6 +117,55 @@ partitions by instance ID. Each tree remains complete even when its points span
 spatial chunks. CSP continues to use the full-cloud path to preserve upstream
 global voxel routing and the optional point-cloud output.
 
+For a single merged COPC input, `--inventory-read-mode sequential` uses a
+bounded Python scan of the compressed point stream. It writes spatial buckets
+and joins them in the same tile order as the R reader, preserving the serial
+inventory output while avoiding repeated COPC spatial reads. The default
+`spatial` mode remains available for LAS/LAZ directories and comparison runs.
+The sequential scan needs scratch for both bucket and final partition files,
+plus a temporary XY stream used to calculate the exact stand-area hull.
+
+Request resources from the COPC header before submission:
+
+```bash
+python3 workflow/resource_request.py merged.copc.laz --dtm-supplied
+python3 workflow/resource_request.py merged.copc.laz --dtm-supplied --profile throughput
+python3 workflow/resource_request.py merged.copc.laz --dtm-supplied --profile throughput \
+  --partition-dir /path/to/completed/partitions
+```
+
+The JSON returns CPUs, RAM, scratch, spatial chunk width, partition count,
+inventory read mode, and worker count within the configured 20-CPU/100-GB
+limits. Use its `--read-chunk-size`, `--inventory-partitions`,
+`--inventory-read-mode`, and `--inventory-workers` values with the CLI.
+The default `stable` profile requests one inventory worker to preserve the
+serial random stream. The opt-in `throughput` profile requests more workers and
+RAM when the COPC point count warrants it. The estimate reads only the header;
+it does not run the inventory or guarantee that a highly skewed tree fits.
+Header-wide density cannot reveal unusually dense local tiles or one giant
+instance; apply the returned hard memory and scratch limits and inspect the
+run metadata. For inputs above the completed end-to-end size, use a bounded
+scan/partition preflight and pass its completed partition directory back with
+`--partition-dir`. The function uses the largest partition size to reduce the
+worker request or reject an estimate above the RAM cap. This empirical screen
+still cannot guarantee that a giant tree fits. The default single inventory
+worker retains the upstream random
+stream. `--inventory-workers` can parallelize independent partitions, but
+values above one use per-partition seeds; derived DBH measurements can differ
+from a single-worker run even when tree IDs and point counts agree.
+
+On a segmented dataset 2924 COPC, the 1.015 GB inventory completed in
+327.7 seconds at 4 CPUs/16 GiB, versus 209.6 seconds at 8 CPUs/32 GiB and
+185.6 seconds at 20 CPUs/100 GiB. The complete 11.593 GB / 925.7-million-point
+COPC finished in 7,990.6 seconds with 20 CPUs/100 GiB and 512 partitions;
+its cgroup peak was 88.95 GiB with no OOM. These are observed requests, not
+minimum safe resources for other clouds. Above this complete-input size, the
+resource function labels full-inventory requests as untested extrapolations.
+An existing 45.3 GB COPC completed the scan/partition stage in 4,279 seconds
+at 1 CPU/16 GiB, but its largest 6.54-GiB partition contains one 109.8-million-
+point instance. The partition preflight rejects a full inventory under 100 GiB
+for that input; extra hash partitions cannot split the one giant instance.
+
 An offline 15,915,252-point merged COPC run exercised two requested instance
 dimensions under a 10-CPU/50-GB Docker limit. With eight 20 m spatial chunks,
 the supplied-DTM run completed in 283.4 seconds and the generated-DTM run in

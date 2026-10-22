@@ -48,7 +48,8 @@ workers <- as.integer(Sys.getenv("CSP_INVENTORY_WORKERS", "1"))
 if (is.na(workers) || workers < 1L || workers > 20L) stop("Invalid CSP_INVENTORY_WORKERS")
 config <- list(inventory_workers = workers, random_seed = 42L, non_tree_ids = 0,
                slice_min = 0.3, slice_max = 4, slice_increment = 0.2,
-               slice_width = 0.1, max_dbh = 1, geometry_threads = 1L)
+               slice_width = 0.1, max_dbh = 1, geometry_threads = 1L,
+               dbh_band_points = inventory_dbh_band_point_budget, dbh_runs = 5L, geometry_k = 10L)
 started <- Sys.time()
 inventories <- inventory_from_partitions(stream, dtm, config, NULL,
                                          sf::st_crs(terra::crs(dtm)))

@@ -170,7 +170,7 @@ large_instance_counts <- function(stream, slug) {
 spool_partition_instances <- function(path, columns, instance, dtm, directory,
                                       point_limit = inventory_instance_point_limit,
                                       batch_points = inventory_consumer_batch_points, large_counts = numeric(),
-                                      spec = NULL) {
+                                      spec = NULL, config = NULL) {
   row_bytes <- 8L * length(columns)
   bytes <- file.info(path)$size
   if (!is.finite(bytes) || bytes %% row_bytes != 0L) {
@@ -206,7 +206,7 @@ spool_partition_instances <- function(path, columns, instance, dtm, directory,
       selected <- points[get(instance) == id, ..normalized_columns]
       if (key %in% names(large_states)) {
         large_states[[key]] <- update_large_instance_summary(
-          large_states[[key]], selected, spec)
+          large_states[[key]], selected, spec, config)
         next
       }
       count <- (if (is.null(instance_counts[[key]])) 0L else instance_counts[[key]]) + nrow(selected)
@@ -279,7 +279,8 @@ inventory_from_partitions <- function(stream, dtm, config, aoi, crs) {
       on.exit(unlink(spool_dir, recursive = TRUE, force = TRUE), add = TRUE)
       spool <- spool_partition_instances(path, layout$columns, layout$spec$instance,
                                          local_dtm, spool_dir,
-                                         large_counts = large_counts, spec = layout$spec)
+                                         large_counts = large_counts, spec = layout$spec,
+                                         config = config)
       if (!length(spool$paths) && !length(spool$large_states)) {
         return(list(empty = TRUE, inventory = NULL))
       }
@@ -310,7 +311,7 @@ inventory_from_partitions <- function(stream, dtm, config, aoi, crs) {
       results <- c(results, lapply(names(spool$large_states), function(id) {
         state <- spool$large_states[[id]]
         if (!state$count) return(NULL)
-        finish_large_instance_summary(state, id, layout$spec, aoi, crs)
+        finish_large_instance_summary(state, id, layout$spec, aoi, crs, config)
       }))
       result <- data.table::rbindlist(results, use.names = TRUE, fill = TRUE)
       gc(FALSE)

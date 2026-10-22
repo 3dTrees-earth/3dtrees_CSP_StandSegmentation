@@ -372,6 +372,29 @@ process_peak_rss_kb <- function() {
   as.numeric(sub("^VmHWM:\\s+([0-9]+).*", "\\1", line[[1L]]))
 }
 
+# Intermediates (DTM tiles, partitions, indexes, logs) go to --scratch-dir,
+# else $TMPDIR (Galaxy and HPC point it at job-local storage), else next to
+# the output. Final outputs are staged beside the output folder so the last
+# step is a same-filesystem rename, which also holds on network storage.
+scratch_parent <- function(config, output_parent) {
+  usable <- function(path) {
+    nzchar(path) && (dir.exists(path) || dir.create(path, recursive = TRUE, showWarnings = FALSE)) &&
+      file.access(path, 2L) == 0L
+  }
+  if (!is.null(config$scratch_dir)) {
+    if (!usable(config$scratch_dir)) abort(sprintf("--scratch-dir is not writable: %s", config$scratch_dir))
+    return(normalizePath(config$scratch_dir))
+  }
+  tmp <- Sys.getenv("TMPDIR", "")
+  if (usable(tmp)) normalizePath(tmp) else output_parent
+}
+
+# Named pipes carry no data on disk, but some network filesystems refuse to
+# create them. Keep them in local memory when available.
+fifo_parent <- function() {
+  if (dir.exists("/dev/shm") && file.access("/dev/shm", 2L) == 0L) "/dev/shm" else tempdir()
+}
+
 publish_stage <- function(stage_dir, output_dir) {
   if (dir.exists(output_dir) && length(list.files(output_dir, all.files = TRUE, no.. = TRUE))) {
     abort(sprintf("Output directory is not empty: %s", output_dir))

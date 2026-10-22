@@ -1,3 +1,10 @@
+# Unreleased (3Dtrees fork)
+
+## Bug fixes
+
+-   `forest_inventory()`: a rejected stem fit (spline position more than 5 m off) returned four values instead of five, so its quality flag (3) was reported as a DBH of 3 m. It now returns DBH = NA with quality flag 3.
+-   `forest_inventory()`: a slice whose planarity or verticality contains NaN (duplicate points in a neighbourhood) no longer aborts the whole tree; NaN values are ignored in the quantile filter.
+
 # CspStandSegmentation 0.2.1
 
 ## New Features and Enhancements

@@ -1,5 +1,5 @@
 run_chunked_inventory <- function(config, files, stage_dir, output_parent, started) {
-  work_dir <- tempfile("csp-chunks-", tmpdir = output_parent)
+  work_dir <- tempfile("csp-chunks-", tmpdir = scratch_parent(config, output_parent))
   dir.create(work_dir)
   on.exit(unlink(work_dir, recursive = TRUE, force = TRUE), add = TRUE)
   bounds <- if (config$inventory_read_mode %in% c("sequential", "copc-owned") &&
@@ -53,7 +53,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     csp_enabled = FALSE, csp_seed_count = 0L, csp_unassigned_point_count = 0L,
     dtm_elapsed_seconds = dtm_elapsed_seconds,
     inventory_instance_point_limit = inventory_instance_point_limit,
-    inventory_dbh_geometry_limit = inventory_dbh_geometry_limit,
+    inventory_dbh_band_points = config$dbh_band_points,
     inventory_large_instance_sample_limit = inventory_large_instance_sample_limit,
     inventory_elapsed_seconds = inventory_elapsed_seconds,
     export_elapsed_seconds = export_elapsed_seconds,

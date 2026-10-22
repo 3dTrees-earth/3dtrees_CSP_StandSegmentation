@@ -48,6 +48,9 @@ giant <- tryCatch({
 }, error = conditionMessage)
 stopifnot(!is.null(giant), grepl("no inventory workers started", giant))
 
+test_config <- list(slice_min = 0.3, slice_max = 4, slice_increment = 0.2,
+                    slice_width = 0.1, max_dbh = 1, geometry_threads = 1L,
+                    non_tree_ids = 0, random_seed = 42L, dbh_band_points = inventory_dbh_band_point_budget, dbh_runs = 5L, geometry_k = 10L)
 fm_spec <- list(source = "FM", instance = "PredInstance_FM",
                 species = "species_id_FM", species_prob = "species_prob_FM")
 fm_columns <- c("X", "Y", "Z", "PredInstance_FM", "species_id_FM",
@@ -63,12 +66,12 @@ append_partition(fm_partition, fm_points)
 streamed <- spool_partition_instances(
   fm_partition, fm_columns, "PredInstance_FM", dtm,
   file.path(work, "streaming"), batch_points = 2L,
-  large_counts = c(`1` = 2), spec = fm_spec
+  large_counts = c(`1` = 2), spec = fm_spec, config = test_config
 )
 stopifnot(identical(names(streamed$paths), "2"),
           streamed$large_states[["1"]]$count == 2)
 large_row <- finish_large_instance_summary(streamed$large_states[["1"]],
-                                           "1", fm_spec, NULL, NULL)
+                                           "1", fm_spec, NULL, NULL, test_config)
 stopifnot(large_row$point_count == 2, large_row$x == 2, large_row$y == 2,
           large_row$z == 3, large_row$height_m == 1,
           large_row$species_id == 7,
@@ -134,6 +137,6 @@ cat("bounded inventory spool test passed\n")
 without_semantic <- data.table::copy(fm_points)
 without_semantic[, PredSemantic_FM := NULL]
 without_semantic <- normalize_inventory_points(without_semantic, dtm)
-state <- update_large_instance_summary(new_large_instance_summary(nrow(without_semantic)), without_semantic, fm_spec)
-row <- finish_large_instance_summary(state, '1', fm_spec, NULL, NULL)
+state <- update_large_instance_summary(new_large_instance_summary(nrow(without_semantic)), without_semantic, fm_spec, test_config)
+row <- finish_large_instance_summary(state, '1', fm_spec, NULL, NULL, test_config)
 stopifnot(is.na(row$wood_point_count), is.na(row$leaf_point_count))

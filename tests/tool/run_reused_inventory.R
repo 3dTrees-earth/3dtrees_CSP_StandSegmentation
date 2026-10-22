@@ -63,7 +63,8 @@ run <- function() {
     inventory_spool_dir = spool_parent,
     non_tree_ids = 0, random_seed = 42L, geometry_threads = 1L,
     slice_min = 0.3, slice_max = 4, slice_increment = 0.2,
-    slice_width = 0.1, max_dbh = 1
+    slice_width = 0.1, max_dbh = 1,
+    dbh_band_points = inventory_dbh_band_point_budget, dbh_runs = 5L, geometry_k = 10L
   )
   stage_dir <- tempfile("csp-reused-stage-", tmpdir = dirname(output_dir))
   dir.create(stage_dir)
@@ -98,7 +99,7 @@ run <- function() {
     largest_instances = audit$largest_instances,
     oversized_instances = audit$oversized_instances,
     inventory_instance_point_limit = inventory_instance_point_limit,
-    inventory_dbh_geometry_limit = inventory_dbh_geometry_limit,
+    inventory_dbh_band_points = config$dbh_band_points,
     inventory_large_instance_sample_limit = inventory_large_instance_sample_limit,
     inventory_workers = workers, inventory_elapsed_seconds = inventory_seconds,
     csp_enabled = FALSE, output_formats = config$output_formats,

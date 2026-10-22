@@ -52,3 +52,4 @@ jobs:
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_owned_inventory.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_bounded_inventory.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_selected_attributes.R
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_dbh_band.R

@@ -19,6 +19,7 @@ index_owned_inventory <- function(files, specs, config, work_dir) {
                  index_queue_mb = config$inventory_index_queue_mb,
                  core_size = config$inventory_core_size, buffer = config$inventory_buffer,
                  retained_points = config$inventory_retained_points,
+                 dbh_band_points = config$dbh_band_points,
                  prefetch_mb = config$inventory_prefetch_mb,
                  non_tree_ids = as.list(as.numeric(config$non_tree_ids)),
                  layouts = lapply(names(layouts), function(slug) list(
@@ -86,7 +87,7 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
       observed[[key]] <- observed[[key]] + nrow(selected)
       if (observed[[key]] > expected[[key]]) abort(sprintf("Excess points for owned instance %s", key))
       if (large[[key]]) {
-        states[[key]] <- update_large_instance_summary(states[[key]], selected, spec)
+        states[[key]] <- update_large_instance_summary(states[[key]], selected, spec, config)
       } else {
         retained[[key]][[length(retained[[key]]) + 1L]] <- selected
       }
@@ -108,7 +109,7 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
   results <- lapply(ids, function(key) {
     # Worker count and scheduling must not alter stochastic measurements.
     set.seed(instance_inventory_seed(config$random_seed, spec$instance, key))
-    if (large[[key]]) return(finish_large_instance_summary(states[[key]], key, spec, aoi, crs))
+    if (large[[key]]) return(finish_large_instance_summary(states[[key]], key, spec, aoi, crs, config))
     points <- data.table::rbindlist(retained[[key]], use.names = TRUE)
     retained[[key]] <<- NULL
     measure_inventory_points(points, spec, config, aoi, crs)
@@ -147,7 +148,7 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
     result$audit$worker_count <- 1L
     return(result)
   }
-  pipe_dir <- tempfile("owned-pipes-", tmpdir = stream$work_dir)
+  pipe_dir <- tempfile("owned-pipes-", tmpdir = fifo_parent())
   if (!dir.create(pipe_dir)) abort("Cannot create owned worker transport directory")
   on.exit(unlink(pipe_dir, recursive = TRUE), add = TRUE)
   paths <- file.path(pipe_dir, sprintf("worker-%02d.fifo", seq_along(groups)))

@@ -15,7 +15,7 @@ from pathlib import Path
 import laspy
 
 
-from inventory_policy import INSTANCE_POINT_LIMIT, SAMPLE_LIMIT
+from inventory_policy import INSTANCE_POINT_LIMIT, SAMPLE_LIMIT, DBH_BAND_POINT_BUDGET
 
 
 def _instance_label(value: object) -> str:
@@ -121,7 +121,7 @@ def owned_resources(input_path, points, point_bytes, density, dtm_supplied,
     batch_gb = min(batch_points * point_bytes, 256 * 1024**2) * 6 / 1e9
     worker_gb = 0.5
     bytes_per_retained_point = 8 * (inventory_columns + 1) * 4
-    minimum_retention_gb = INSTANCE_POINT_LIMIT * bytes_per_retained_point / 1e9
+    minimum_retention_gb = max(INSTANCE_POINT_LIMIT, SAMPLE_LIMIT + DBH_BAND_POINT_BUDGET) * bytes_per_retained_point / 1e9
     while workers > 1 and base_gb + batch_gb + workers * worker_gb + minimum_retention_gb > max_memory_gb:
         workers -= 1
     # A bounded queue lets the decoder advance beyond a slow spatial cluster.
@@ -138,11 +138,11 @@ def owned_resources(input_path, points, point_bytes, density, dtm_supplied,
     queue_gb = prefetch_mb * 1024**2 / 1e9 if workers > 1 else 0
     budget = max_memory_gb - base_gb - batch_gb - workers * worker_gb - queue_gb
     retained_points = min(40_000_000, int(budget * 1e9 / bytes_per_retained_point))
-    if retained_points < INSTANCE_POINT_LIMIT:
-        raise ValueError("RAM cap cannot fit one standard owned instance plus the COPC batch")
+    if retained_points < max(INSTANCE_POINT_LIMIT, SAMPLE_LIMIT + DBH_BAND_POINT_BUDGET):
+        raise ValueError("RAM cap cannot fit one standard or large owned instance plus the COPC batch")
     held_points = min(points, retained_points)
     if windows is not None:
-        held_points = min(held_points, max(sum(n if n <= INSTANCE_POINT_LIMIT else SAMPLE_LIMIT
+        held_points = min(held_points, max(sum(n if n <= INSTANCE_POINT_LIMIT else SAMPLE_LIMIT + DBH_BAND_POINT_BUDGET
                                              for n in window["counts"]) for window in windows))
     estimate = base_gb + batch_gb + workers * worker_gb + queue_gb + held_points * bytes_per_retained_point / 1e9
     memory = min(max_memory_gb, max(4, _round_up(estimate, 4)))
@@ -166,7 +166,7 @@ def owned_resources(input_path, points, point_bytes, density, dtm_supplied,
             "One complete index pass plus spatial window rereads; each window has one decoder shared by disjoint ID workers.",
             "Worker and decoder counts share the CPU budget; a one-CPU cap time-shares both processes.",
             "Scratch excludes the existing input. DTM scratch for very large spatial extents needs separate sizing.",
-            "Instances above two million points retain complete counts/extrema/hulls but sample medians and omit DBH.",
+            "Instances above two million points keep exact counts/extrema/hulls, sample medians, and a stem band of at most 1 M points for DBH.",
             "Exact hull vertex counts can grow with geometry; the hard RAM limit remains required.",
             "The 20 m buffer expands to cover owned instance extents; point counts must match the global index.",
         ],
@@ -442,7 +442,7 @@ def request_resources(
             "Multiple inventory workers use per-partition random seeds; derived DBH values may differ.",
             "Generated DTM candidates from COPC use one verified sequential point read.",
             "Without an instance-count audit, partition preflight cannot detect a giant instance.",
-            "Instances above two million points use bounded summaries when the scan supplies an oversized-instance audit; their DBH is unavailable and selected medians are sampled.",
+            "Instances above two million points use bounded summaries when the scan supplies an oversized-instance audit; DBH comes from a stem band of at most 1 M points and selected medians are sampled.",
             "DBH geometry is also capped at 500,000 normalized points per group during inventory.",
         ],
     }

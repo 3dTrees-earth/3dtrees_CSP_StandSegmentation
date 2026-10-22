@@ -1,0 +1,97 @@
+{
+  "gpstime": {
+    "python": "gps_time",
+    "selector": "t",
+    "r_storage": "double"
+  },
+  "ScanAngle": {
+    "python": "scan_angle",
+    "selector": "a",
+    "r_storage": "double"
+  },
+  "Intensity": {
+    "python": "intensity",
+    "selector": "i",
+    "r_storage": "integer"
+  },
+  "NumberOfReturns": {
+    "python": "number_of_returns",
+    "selector": "n",
+    "r_storage": "integer"
+  },
+  "ReturnNumber": {
+    "python": "return_number",
+    "selector": "r",
+    "r_storage": "integer"
+  },
+  "Classification": {
+    "python": "classification",
+    "selector": "c",
+    "r_storage": "integer"
+  },
+  "Synthetic_flag": {
+    "python": "synthetic",
+    "selector": "s",
+    "r_storage": "logical"
+  },
+  "Keypoint_flag": {
+    "python": "key_point",
+    "selector": "k",
+    "r_storage": "logical"
+  },
+  "Withheld_flag": {
+    "python": "withheld",
+    "selector": "w",
+    "r_storage": "logical"
+  },
+  "Overlap_flag": {
+    "python": "overlap",
+    "selector": "o",
+    "r_storage": "logical"
+  },
+  "UserData": {
+    "python": "user_data",
+    "selector": "u",
+    "r_storage": "integer"
+  },
+  "PointSourceID": {
+    "python": "point_source_id",
+    "selector": "p",
+    "r_storage": "integer"
+  },
+  "EdgeOfFlightline": {
+    "python": "edge_of_flight_line",
+    "selector": "e",
+    "r_storage": "integer"
+  },
+  "ScanDirectionFlag": {
+    "python": "scan_direction_flag",
+    "selector": "d",
+    "r_storage": "integer"
+  },
+  "R": {
+    "python": "red",
+    "selector": "R",
+    "r_storage": "integer"
+  },
+  "G": {
+    "python": "green",
+    "selector": "G",
+    "r_storage": "integer"
+  },
+  "B": {
+    "python": "blue",
+    "selector": "B",
+    "r_storage": "integer"
+  },
+  "NIR": {
+    "python": "nir",
+    "selector": "N",
+    "r_storage": "integer"
+  },
+  "ScannerChannel": {
+    "python": "scanner_channel",
+    "selector": "C",
+    "r_storage": "integer"
+  }
+}

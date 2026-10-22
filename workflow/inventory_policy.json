@@ -1,0 +1,7 @@
+{
+  "schema_version": 1,
+  "instance_point_limit": 2000000,
+  "dbh_geometry_limit": 500000,
+  "large_instance_sample_limit": 100000,
+  "consumer_batch_points": 100000
+}

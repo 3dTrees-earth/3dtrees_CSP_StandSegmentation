@@ -29,23 +29,51 @@ inventory_las <- function(points) {
   lidR::LAS(data)
 }
 
+in_dbh_band <- function(points, config) {
+  is.finite(points$Z) & points$Z > config$slice_min & points$Z < config$slice_max
+}
+
+# Keep every stem-band point while the band fits the budget. Above it, keep
+# the first point (source order) per voxel, starting at the policy's initial
+# size and doubling until the band fits; once thinned, later batches use the
+# same grid. Original coordinates are kept, nothing is averaged.
+voxel_keys <- function(points, size) {
+  z <- if ("Zref" %in% names(points)) points$Zref else points$Z
+  data.table::data.table(kx = floor(points$X / size), ky = floor(points$Y / size), kz = floor(z / size))
+}
+
+dbh_band_keep <- function(points, budget, voxel = 0) {
+  if (voxel <= 0 && nrow(points) <= budget) return(list(keep = rep(TRUE, nrow(points)), voxel = 0))
+  size <- if (voxel > 0) voxel else inventory_dbh_band_initial_voxel_m
+  repeat {
+    keep <- !duplicated(voxel_keys(points, size))
+    if (sum(keep) <= budget) return(list(keep = keep, voxel = size))
+    size <- size * 2
+  }
+}
+
+with_dbh_band <- function(result, band_points, source_points, voxel) {
+  result[, `:=`(dbh_band_points = as.numeric(band_points),
+                dbh_band_source_points = as.numeric(source_points),
+                dbh_band_voxel_m = voxel)]
+  result
+}
+
 measure_inventory_points <- function(points, spec, config, aoi, crs) {
   # Preserve the partition reader's existing grouped calculation and RNG order.
-  # Split only when the aggregate geometry guard requires per-ID decisions.
-  geometry_points <- function(x) sum(x$Z > config$slice_min & x$Z < config$slice_max, na.rm = TRUE)
+  # Split only when the aggregate stem band exceeds the per-tree budget.
+  budget <- config$dbh_band_points
   measure <- function(selected) {
-    if (geometry_points(selected) <= inventory_dbh_geometry_limit) {
-      return(inventory_for_spec(inventory_las(selected), spec, config, aoi, crs))
-    }
-    id <- as.character(selected[[spec$instance]][[1L]])
-    state <- new_large_instance_summary(nrow(selected))
-    for (start in seq.int(1L, nrow(selected), by = inventory_consumer_batch_points)) {
-      end <- min(start + inventory_consumer_batch_points - 1L, nrow(selected))
-      state <- update_large_instance_summary(state, selected[start:end], spec)
-    }
-    finish_large_instance_summary(state, id, spec, aoi, crs, method = "streaming_geometry_limit")
+    band <- in_dbh_band(selected, config)
+    if (sum(band) <= budget) return(inventory_for_spec(inventory_las(selected), spec, config, aoi, crs))
+    thinned <- dbh_band_keep(selected[band], budget)
+    keep <- rep(TRUE, nrow(selected))
+    keep[which(band)[!thinned$keep]] <- FALSE
+    result <- inventory_for_spec(inventory_las(selected[keep]), spec, config, aoi, crs)
+    result[, point_count := nrow(selected)]
+    with_dbh_band(result, sum(thinned$keep), sum(band), thinned$voxel)
   }
-  if (geometry_points(points) <= inventory_dbh_geometry_limit) return(measure(points))
+  if (sum(in_dbh_band(points, config)) <= budget) return(measure(points))
   groups <- split(points, by = spec$instance, keep.by = TRUE)
   data.table::rbindlist(lapply(groups, measure), use.names = TRUE, fill = TRUE)
 }
@@ -113,6 +141,98 @@ filter_inventory_to_aoi <- function(inventory, aoi, crs) {
   inventory[lengths(sf::st_intersects(points, aoi)) > 0L, ]
 }
 
+# One upstream forest_inventory() call; returns one row per tree or NULL.
+# Upstream simplifies a one-tree result to an 8x1 frame keyed by row names.
+upstream_inventory <- function(las, instance, config) {
+  measured <- tryCatch(
+    CspStandSegmentation::forest_inventory(
+      las,
+      slice_min = config$slice_min,
+      slice_max = config$slice_max,
+      increment = config$slice_increment,
+      width = config$slice_width,
+      max_dbh = config$max_dbh,
+      n_cores = config$geometry_threads,
+      tree_id_col = instance,
+      non_tree_id = config$non_tree_ids
+    ),
+    error = function(error) {
+      warning(sprintf("Inventory measurements failed for %s: %s", instance, conditionMessage(error)))
+      NULL
+    }
+  )
+  if (is.null(measured) || !nrow(measured)) return(NULL)
+  if (!instance %in% names(measured) && ncol(measured) == 1L) {
+    values <- stats::setNames(as.numeric(measured[[1L]]), rownames(measured))
+    measured <- data.table::as.data.table(as.list(values))
+  }
+  if (!instance %in% names(measured)) return(NULL)
+  measured <- data.table::as.data.table(measured)
+  data.table::setnames(measured, instance, "instance_id")
+  measured
+}
+
+# Upstream fits stem circles with RANSAC on a small planar/vertical subset of
+# each slice, so one run depends on the random draw and on point order. The
+# upstream algorithm is kept unchanged; reproducibility and stability come
+# from around it: points are sorted, stem-band geometry is computed once,
+# the fit runs config$dbh_runs times with seeds derived from the tree's
+# identity, and the run with the median DBH is reported (its position and
+# quality code too). Height and crown area do not depend on the draw.
+measure_tree <- function(points, instance, id, config) {
+  data.table::setorderv(points, c("X", "Y", "Z"))
+  band <- which(points$Z > config$slice_min & points$Z < config$slice_max)
+  runs <- if (length(band) >= 3L) config$dbh_runs else 1L
+  if (length(band) > config$geometry_k) {
+    geometry <- CspStandSegmentation::add_geometry(
+      suppressMessages(suppressWarnings(lidR::LAS(as.data.frame(points[band, .(X, Y, Z)])))),
+      k = config$geometry_k, n_cores = config$geometry_threads)@data
+    for (feature in c("Planarity", "Linearity", "Verticality")) {
+      values <- rep(NA_real_, nrow(points))
+      values[band] <- geometry[[feature]]
+      data.table::set(points, j = feature, value = values)
+    }
+  }
+  las <- suppressMessages(suppressWarnings(lidR::LAS(as.data.frame(points))))
+  seed <- instance_inventory_seed(config$random_seed, instance, id)
+  fits <- lapply(seq_len(runs), function(run) {
+    set.seed((seed + run - 1L) %% .Machine$integer.max)
+    suppressMessages(upstream_inventory(las, instance, config))
+  })
+  fits <- data.table::rbindlist(fits, use.names = TRUE, fill = TRUE)
+  if (!nrow(fits)) return(NULL)
+  fitted <- which(is.finite(fits$DBH))
+  chosen <- if (length(fitted) * 2L > nrow(fits)) {
+    fitted[order(fits$DBH[fitted])][(length(fitted) + 1L) %/% 2L]
+  } else {
+    # Most runs failed: report the most frequent failure code, no DBH.
+    codes <- fits$quality_flag
+    if (all(is.na(codes))) 1L else which(codes == as.numeric(names(which.max(table(codes)))))[[1L]]
+  }
+  result <- fits[chosen]
+  if (!length(fitted) * 2L > nrow(fits)) result[, DBH := NA_real_]
+  result[, `:=`(Height = fits$Height[[1L]], ConvexHullArea = fits$ConvexHullArea[[1L]],
+                dbh_runs = nrow(fits), dbh_runs_fitted = length(fitted),
+                dbh_spread_m = if (length(fitted)) diff(range(fits$DBH[fitted])) else NA_real_)]
+  result
+}
+
+measure_trees <- function(las, instance, config) {
+  columns <- intersect(c("X", "Y", "Z", "Zref", instance), names(las@data))
+  trees <- split(las@data[!is.na(get(instance)) & !(get(instance) %in% config$non_tree_ids), ..columns],
+                 by = instance, keep.by = TRUE)
+  measured <- data.table::rbindlist(lapply(trees, function(points) {
+    measure_tree(data.table::copy(points), instance, points[[instance]][[1L]], config)
+  }), use.names = TRUE, fill = TRUE)
+  if (!nrow(measured)) {
+    measured <- data.table::data.table(
+      instance_id = numeric(), X = numeric(), Y = numeric(), Z = numeric(),
+      DBH = numeric(), quality_flag = integer(), Height = numeric(), ConvexHullArea = numeric(),
+      dbh_runs = integer(), dbh_runs_fitted = integer(), dbh_spread_m = numeric())
+  }
+  measured
+}
+
 inventory_for_spec <- function(las, spec, config, aoi, crs) {
   instance <- spec$instance
   available <- names(las@data)
@@ -135,56 +255,12 @@ inventory_for_spec <- function(las, spec, config, aoi, crs) {
     fallback_y = stats::median(Y),
     fallback_z = min(get(z_original), na.rm = TRUE),
     fallback_height = max(Z, na.rm = TRUE) - min(Z, na.rm = TRUE),
-    fallback_hull = polygon_area(X, Y)
+    fallback_hull = polygon_area(X, Y),
+    dbh_band_points = as.numeric(sum(Z > config$slice_min & Z < config$slice_max, na.rm = TRUE))
   ), by = instance]
   data.table::setnames(base, instance, "instance_id")
 
-  measured <- tryCatch(
-    CspStandSegmentation::forest_inventory(
-      las,
-      slice_min = config$slice_min,
-      slice_max = config$slice_max,
-      increment = config$slice_increment,
-      width = config$slice_width,
-      max_dbh = config$max_dbh,
-      n_cores = config$geometry_threads,
-      tree_id_col = instance,
-      non_tree_id = config$non_tree_ids
-    ),
-    error = function(error) {
-      warning(sprintf("Inventory measurements failed for %s: %s", instance, conditionMessage(error)))
-      NULL
-    }
-  )
-
-  # Upstream simplifies a one-tree inventory to an 8x1 matrix/data frame whose
-  # field names are row names. Restore the same one-row schema returned for
-  # multi-tree calls before applying the normal merge path.
-  if (!is.null(measured) && nrow(measured) && !instance %in% names(measured) && ncol(measured) == 1L) {
-    fields <- rownames(measured)
-    required_fields <- c(instance, "X", "Y", "Z", "DBH", "quality_flag", "Height", "ConvexHullArea")
-    if (all(required_fields %in% fields)) {
-      values <- as.numeric(measured[[1L]])
-      names(values) <- fields
-      measured <- data.table::as.data.table(as.list(values))
-    }
-  }
-
-  if (is.null(measured) || !nrow(measured) || !instance %in% names(measured)) {
-    if (!is.null(measured) && nrow(measured) && !instance %in% names(measured)) {
-      warning(sprintf(
-        "Inventory measurements for %s omitted the instance column; using fallback measurements for this partition",
-        instance
-      ))
-    }
-    measured <- data.table::data.table(
-      instance_id = numeric(), X = numeric(), Y = numeric(), Z = numeric(),
-      DBH = numeric(), quality_flag = integer(), Height = numeric(), ConvexHullArea = numeric()
-    )
-  } else {
-    measured <- data.table::as.data.table(measured)
-    data.table::setnames(measured, instance, "instance_id")
-  }
+  measured <- measure_trees(las, instance, config)
 
   result <- merge(base, measured, by = "instance_id", all.x = TRUE, sort = FALSE)
   result[, `:=`(
@@ -196,7 +272,9 @@ inventory_for_spec <- function(las, spec, config, aoi, crs) {
     dbh_m = DBH,
     height_m = data.table::fcoalesce(Height, fallback_height),
     convex_hull_area_m2 = data.table::fcoalesce(ConvexHullArea, fallback_hull),
-    dbh_quality_code = data.table::fcoalesce(as.integer(quality_flag), 9L)
+    dbh_quality_code = data.table::fcoalesce(as.integer(quality_flag), 9L),
+    dbh_band_source_points = dbh_band_points,
+    dbh_band_voxel_m = 0
   )]
   result[, dbh_quality_label := quality_label(dbh_quality_code, dbh_m)]
   result[, inventory_method := "standard"]
@@ -219,6 +297,8 @@ inventory_for_spec <- function(las, spec, config, aoi, crs) {
     "species_id", "species_prob", "species_conflict_fraction",
     "pred_score_fm", "pred_score_mixed", "wood_point_count", "leaf_point_count",
     "wood_share", "leaf_share", "dbh_quality_code", "dbh_quality_label",
+    "dbh_runs", "dbh_runs_fitted", "dbh_spread_m",
+    "dbh_band_points", "dbh_band_source_points", "dbh_band_voxel_m",
     "inventory_method"
   )
   result <- result[, intersect(keep, names(result)), with = FALSE]
@@ -242,17 +322,45 @@ new_large_instance_summary <- function(expected_points) {
     min_zref = Inf, min_z = Inf, max_z = -Inf, hull = NULL,
     sample = NULL, species_counts = numeric(), valid_species_count = 0,
     wood_count = 0, leaf_count = 0, has_semantic = FALSE, score_first = NA_real_,
-    score_mixed = FALSE
+    score_mixed = FALSE, crown_hull = NULL,
+    band = NULL, band_keys = NULL, band_source_points = 0, band_voxel = 0
   )
 }
 
-update_large_instance_summary <- function(state, points, spec) {
+update_large_instance_summary <- function(state, points, spec, config) {
   previous_count <- state$count
   state$count <- previous_count + nrow(points)
   state$min_zref <- min(state$min_zref, points$Zref)
   state$min_z <- min(state$min_z, points$Z)
   state$max_z <- max(state$max_z, points$Z)
   state$hull <- update_streaming_hull(state$hull, points$X, points$Y)
+  # Same crown definition as the full measurement: points above 0.5 m.
+  crown <- points$Z > 0.5
+  if (any(crown)) state$crown_hull <- update_streaming_hull(state$crown_hull, points$X[crown], points$Y[crown])
+
+  # Stem band for DBH, in source order, bounded by the per-tree budget.
+  band <- in_dbh_band(points, config)
+  if (any(band)) {
+    state$band_source_points <- state$band_source_points + sum(band)
+    incoming <- points[band, .(X, Y, Z, Zref)]
+    if (state$band_voxel > 0) {
+      # Already thinned: drop incoming points whose voxel is taken by an
+      # earlier point. Same result as re-thinning the whole band, without
+      # rescanning the retained points on every batch.
+      keys <- voxel_keys(incoming, state$band_voxel)
+      keep <- !duplicated(keys)
+      keep[keys[state$band_keys, on = c("kx", "ky", "kz"), which = TRUE, nomatch = 0L]] <- FALSE
+      incoming <- incoming[keep]
+      state$band_keys <- data.table::rbindlist(list(state$band_keys, keys[keep]))
+    }
+    state$band <- data.table::rbindlist(list(state$band, incoming))
+    if (nrow(state$band) > config$dbh_band_points) {
+      thinned <- dbh_band_keep(state$band, config$dbh_band_points, state$band_voxel)
+      state$band <- state$band[thinned$keep]
+      state$band_voxel <- thinned$voxel
+      state$band_keys <- voxel_keys(state$band, state$band_voxel)
+    }
+  }
 
   # A fixed stride gives a deterministic, bounded sample across the full
   # source order. Only medians use it; counts, extrema and hull remain exact.
@@ -296,7 +404,19 @@ update_large_instance_summary <- function(state, points, spec) {
   state
 }
 
-finish_large_instance_summary <- function(state, id, spec, aoi, crs,
+# DBH, its quality and the DBH-height position come from the retained stem
+# band; counts, height, crown and species stay exact streaming summaries.
+large_instance_dbh <- function(state, id, spec, config, crs) {
+  if (is.null(state$band) || nrow(state$band) < 3L) return(NULL)
+  band <- data.table::copy(state$band)
+  data.table::set(band, j = spec$instance, value = as.numeric(id))
+  band_spec <- list(instance = spec$instance, source = spec$source)
+  measured <- inventory_for_spec(inventory_las(band), band_spec, config, NULL, crs)
+  if (!nrow(measured) || measured$dbh_quality_code[[1L]] == 9L) return(NULL)
+  measured[1L]
+}
+
+finish_large_instance_summary <- function(state, id, spec, aoi, crs, config,
                                           method = "streaming_large_instance") {
   if (state$count != state$expected_points || is.null(state$sample) ||
       !nrow(state$sample)) {
@@ -341,18 +461,32 @@ finish_large_instance_summary <- function(state, id, spec, aoi, crs,
       }
     }
   }
+  dbh <- large_instance_dbh(state, id, spec, config, crs)
+  # The stem position replaces the sample median only when a DBH was fitted.
+  located <- !is.null(dbh) && is.finite(dbh$dbh_m)
+  crown <- if (is.null(state$crown_hull)) state$hull else state$crown_hull
   result <- data.table::data.table(
     segmentation_source = spec$source, instance_dimension = spec$instance,
-    instance_id = as.numeric(id), x = stats::median(sample$X),
-    y = stats::median(sample$Y), z = state$min_zref, dbh_m = NA_real_,
+    instance_id = as.numeric(id),
+    x = if (located) dbh$x else stats::median(sample$X),
+    y = if (located) dbh$y else stats::median(sample$Y),
+    z = if (located) dbh$z else state$min_zref,
+    dbh_m = if (located) dbh$dbh_m else NA_real_,
     height_m = state$max_z - state$min_z,
-    convex_hull_area_m2 = polygon_area(state$hull$x, state$hull$y),
+    convex_hull_area_m2 = polygon_area(crown$x, crown$y),
     point_count = state$count, species_id = species_id,
     species_prob = species_prob, species_conflict_fraction = conflict,
     pred_score_fm = score, pred_score_mixed = score_mixed,
     wood_point_count = wood_count, leaf_point_count = leaf_count,
     wood_share = wood_share, leaf_share = leaf_share,
-    dbh_quality_code = 9L, dbh_quality_label = "dbh_unavailable",
+    dbh_quality_code = if (is.null(dbh)) 9L else dbh$dbh_quality_code,
+    dbh_quality_label = if (is.null(dbh)) "dbh_unavailable" else dbh$dbh_quality_label,
+    dbh_runs = if (is.null(dbh)) NA_integer_ else dbh$dbh_runs,
+    dbh_runs_fitted = if (is.null(dbh)) NA_integer_ else dbh$dbh_runs_fitted,
+    dbh_spread_m = if (is.null(dbh)) NA_real_ else dbh$dbh_spread_m,
+    dbh_band_points = if (is.null(state$band)) 0 else as.numeric(nrow(state$band)),
+    dbh_band_source_points = state$band_source_points,
+    dbh_band_voxel_m = state$band_voxel,
     inventory_method = method
   )
   filter_inventory_to_aoi(result, aoi, crs)

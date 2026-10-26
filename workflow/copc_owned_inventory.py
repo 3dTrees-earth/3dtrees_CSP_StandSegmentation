@@ -29,7 +29,7 @@ import numpy as np
 from stream_inventory_partitions import decompression_groups, update_hull, requested_dimensions
 
 MAX_IDS = 1_000_000
-from inventory_policy import INSTANCE_POINT_LIMIT as STANDARD_LIMIT, SAMPLE_LIMIT
+from inventory_policy import INSTANCE_POINT_LIMIT as STANDARD_LIMIT, SAMPLE_LIMIT, DBH_BAND_POINT_BUDGET
 
 
 def identity(path):
@@ -174,11 +174,13 @@ def summarize_batch(states, points, instance, non_tree):
         state["maxs_raw"] = [max(a, int(b)) for a, b in zip(state["maxs_raw"], maxima[i])]
 
 
-def plan_windows(instances, origin, size, buffer, retained_limit):
+def plan_windows(instances, origin, size, buffer, retained_limit, band_budget=DBH_BAND_POINT_BUDGET):
     if not math.isfinite(size) or size <= 0 or not math.isfinite(buffer) or buffer < 0:
         raise ValueError("Invalid owned core size or buffer")
-    if retained_limit < STANDARD_LIMIT:
-        raise ValueError("Window retention budget must fit one standard instance")
+    # A streamed large tree holds its median sample plus its bounded stem band.
+    large_cost = SAMPLE_LIMIT + band_budget
+    if retained_limit < max(STANDARD_LIMIT, large_cost):
+        raise ValueError("Window retention budget must fit one standard and one large instance")
     cores = {}
     for instance in instances:
         core = tuple(math.floor((v - o) / size) for v, o in zip(instance["centroid"], origin))
@@ -188,7 +190,7 @@ def plan_windows(instances, origin, size, buffer, retained_limit):
     for core, members in sorted(cores.items()):
         batches, batch, retained = [], [], 0
         for member in sorted(members, key=lambda item: item["id"]):
-            cost = member["count"] if member["count"] <= STANDARD_LIMIT else SAMPLE_LIMIT
+            cost = member["count"] if member["count"] <= STANDARD_LIMIT else large_cost
             if batch and retained + cost > retained_limit:
                 batches.append(batch)
                 batch, retained = [], 0
@@ -248,7 +250,8 @@ def build_index(config):
                 instances.append(state)
             layout["instances"] = sorted(instances, key=lambda item: item["id"])
             layout["windows"] = plan_windows(instances, header.mins[:2], config["core_size"],
-                                                config["buffer"], config["retained_points"])
+                                                config["buffer"], config["retained_points"],
+                                                config.get("dbh_band_points", DBH_BAND_POINT_BUDGET))
         available = list(header.point_format.dimension_names)
         total = int(header.point_count)
     if identity(path) != source_identity:

@@ -87,7 +87,7 @@ class OwnedTests(unittest.TestCase):
         instances = [dict(id=i, count=1500000, centroid=[x, 5],
                           mins=[x - 50, 0, 0], maxs=[x + 50, 10, 20])
                      for i, x in enumerate((0, 49, 50, 100), start=1)]
-        windows = owned.plan_windows(instances, [0, 0], 50, 20, 2000000)
+        windows = owned.plan_windows(instances, [0, 0], 50, 20, 2100000)
         self.assertEqual([item["owner_core"] for item in instances],
                          [[0, 0], [0, 0], [1, 0], [2, 0]])
         self.assertEqual(len(windows), 4)

@@ -94,7 +94,7 @@ usage <- function() {
     "  --inventory-index-queue-mb MIB      Compressed index queue (32..1024; default: 256)",
     "  --inventory-core-size METRES        Owned core width (default: 50)",
     "  --inventory-buffer METRES           Owned window initial buffer (default: 20)",
-    "  --inventory-batch-points COUNT      Max COPC node batch (default: 2000000)",
+    "  --inventory-batch-points COUNT      Max COPC node batch (default: 1000000)",
     "  --inventory-prefetch-mb MIB         Shared in-memory queue (default: 256; max: 16384)",
     "  --inventory-retained-points COUNT   Window retention budget (default: 40000000)",
     "  --inventory-decode-threads COUNT    COPC decode threads per worker (default: 4)",
@@ -119,6 +119,10 @@ usage <- function() {
     "  --slice-increment METRES           Inventory slice step (default: 0.2)",
     "  --slice-width METRES               Inventory slice width (default: 0.1)",
     "  --max-dbh METRES                   Maximum accepted DBH (default: 1)",
+    "  --dbh-band-points N                Stem-band points kept per tree for DBH; above it",
+    "                                     points are merged from 1 mm voxels up (default: 1000000)",
+    "  --dbh-runs N                       Upstream DBH fits per tree; the median is reported (default: 5)",
+    "  --scratch-dir DIR                  Intermediate files (default: $TMPDIR, else next to output)",
     sep = "\n"
   )
 }
@@ -172,7 +176,10 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     slice_max = 4,
     slice_increment = 0.2,
     slice_width = 0.1,
-    max_dbh = 1
+    max_dbh = 1,
+    dbh_band_points = inventory_dbh_band_point_budget,
+    dbh_runs = 5L,
+    scratch_dir = NULL
   )
 
   if (any(args %in% c("--help", "-h"))) {
@@ -243,6 +250,9 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--slice-increment") config$slice_increment <- parse_number(value, key, 0.001)
     else if (key == "--slice-width") config$slice_width <- parse_number(value, key, 0.001)
     else if (key == "--max-dbh") config$max_dbh <- parse_number(value, key, 0.001)
+    else if (key == "--dbh-band-points") config$dbh_band_points <- parse_number(value, key, 1000, 100000000, TRUE)
+    else if (key == "--dbh-runs") config$dbh_runs <- parse_number(value, key, 1, 99, TRUE)
+    else if (key == "--scratch-dir") config$scratch_dir <- value
     else abort(sprintf("Unknown option: %s", key))
   }
 
@@ -256,6 +266,10 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
   }
   if (config$inventory_index_workers > 0L && config$inventory_read_mode != "copc-owned") {
     abort("--inventory-index-workers requires --inventory-read-mode copc-owned")
+  }
+  if (config$inventory_read_mode == "copc-owned" &&
+      config$inventory_retained_points < inventory_large_instance_sample_limit + config$dbh_band_points) {
+    abort("--inventory-retained-points must hold one large tree: sample limit + --dbh-band-points")
   }
   if (config$inventory_read_mode == "copc-owned" && config$enable_csp) {
     abort("Owned COPC inventory cannot be combined with --enable-csp")

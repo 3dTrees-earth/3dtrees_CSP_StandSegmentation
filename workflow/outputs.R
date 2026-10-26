@@ -134,20 +134,34 @@ write_outputs <- function(inventories, area, stage_dir, config, crs) {
     instance_dimension = character(), instance_id = numeric(), message = character()
   )
   large <- if ("inventory_method" %in% names(combined)) {
-    combined[inventory_method %in% c("streaming_large_instance", "streaming_geometry_limit"),
+    combined[inventory_method == "streaming_large_instance",
              .(segmentation_source, instance_dimension, instance_id, point_count,
-               inventory_method)]
+               inventory_method, dbh_m)]
   } else {
     combined[0, .(segmentation_source, instance_dimension, instance_id, point_count,
-                  inventory_method = character())]
+                  inventory_method = character(), dbh_m = numeric())]
   }
   if (nrow(large)) {
     issues <- data.table::rbindlist(list(issues, large[, .(
-      severity = "warning", code = inventory_method,
+      severity = "info", code = inventory_method,
       segmentation_source, instance_dimension, instance_id,
       message = sprintf(
-        "%.0f points; DBH unavailable; x/y, species probability and FM score use a deterministic sample of at most %d points",
-        point_count, inventory_large_instance_sample_limit
+        "%.0f points; species probability and FM score use a deterministic sample of at most %d points%s",
+        point_count, inventory_large_instance_sample_limit,
+        ifelse(is.na(dbh_m), "; x/y from that sample because no DBH could be fitted", "")
+      )
+    )]))
+  }
+  thinned <- if ("dbh_band_voxel_m" %in% names(combined)) {
+    combined[is.finite(dbh_band_voxel_m) & dbh_band_voxel_m > 0]
+  } else combined[0]
+  if (nrow(thinned)) {
+    issues <- data.table::rbindlist(list(issues, thinned[, .(
+      severity = "info", code = "dbh_band_thinned",
+      segmentation_source, instance_dimension, instance_id,
+      message = sprintf(
+        "Stem band kept %.0f of %.0f points, one per %.0f mm voxel, to fit the per-tree DBH budget",
+        dbh_band_points, dbh_band_source_points, dbh_band_voxel_m * 1000
       )
     )]))
   }

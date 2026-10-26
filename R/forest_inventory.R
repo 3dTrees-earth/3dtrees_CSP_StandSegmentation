@@ -332,8 +332,8 @@ forest_inventory <- function(las,
     } else {
       q <- min(0.99, 1 - sqrt(100 / nrow(slice)) + 0.05)
       planes <- slice[
-        Planarity  > quantile(Planarity,  q) &
-          Verticality > quantile(Verticality, q)
+        Planarity  > quantile(Planarity,  q, na.rm = TRUE) &
+          Verticality > quantile(Verticality, q, na.rm = TRUE)
       ]
     }
 
@@ -407,7 +407,7 @@ forest_inventory <- function(las,
     if (is.na(dbh) | dbh > max_dbh | dbh < 0) {
       return(c(X = mean(tree$X), Y = mean(tree$Y), Z = Z, DBH = NA, quality_flag = 3))
     } else if (x > (mean(tree$X) + 5) | x < (mean(tree$X) - 5) | y > (mean(tree$Y) + 5) | y < (mean(tree$Y) - 5)) {
-      return(c(X = mean(tree$X), Y = mean(tree$Y), Z = Z, quality_flag = 3))
+      return(c(X = mean(tree$X), Y = mean(tree$Y), Z = Z, DBH = NA, quality_flag = 3))
     } else {
       return(c(X = x, Y = y, Z = Z, DBH = dbh, quality_flag = 4))
     }

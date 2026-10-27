@@ -43,8 +43,12 @@ stopifnot(
   identical(config$output_formats, c("csv", "tsv", "json", "gpkg")),
   identical(config$dtm_candidate_resolution, 0.1),
   identical(config$dtm_streaming_threshold, 50000000L),
+  isTRUE(config$dbh_evidence),
   !config$enable_csp
 )
+stopifnot(!parse_cli_args(c("--input", "input.laz", "--output-dir", "output",
+                             "--segmentation-spec", "PredInstance_SAT",
+                             "--dbh-evidence", "false"))$dbh_evidence)
 
 formats_config <- parse_cli_args(c(
   "--input", "merged.copc.laz", "--output-dir", "output",

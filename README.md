@@ -101,6 +101,23 @@ combination. Outputs include:
 JSON table exports retain double-precision coordinates so the selected formats
 describe the same tree positions.
 
+Every run also writes, as CSV and Parquet, the evidence each DBH and crown area
+was computed from; `--dbh-evidence false` switches it off. The fit and every
+other output stay byte-identical either way; nothing here feeds back into a
+measurement.
+
+| File | One row per | Columns |
+| --- | --- | --- |
+| `dbh/dbh_slices.*` | tree × stem slice of the reported (median) run | `instance_dimension`, `instance_id`, `run`, `slice_id`, `z_lo_m`, `z_hi_m` (above the DTM), `ground_z` (m, source CRS), `n_points`, `n_fit_points` (points handed to RANSAC), `circle_x`, `circle_y`, `radius_m` (raw fit), `status`, `spline_x`, `spline_y`, `spline_r` (the smoothing splines at the slice's lower edge, the abscissa the 1.3 m prediction uses; empty when no spline was fitted) |
+| `dbh/dbh_runs.*` | tree × DBH run | `run`, `seed`, `dbh_m`, `quality_code`, `reported` |
+| `dbh/crown_hulls.*` | tree | `vertex_count` and the convex hull polygon (`wkt` in the CSV, GeoParquet 1.1 WKB geometry in the source CRS) of the points above 0.5 m, or of all points when fewer than three are |
+
+`status` names the upstream rule that set a slice aside: `fitted`, `outlier_2sd`
+(radius more than two standard deviations from the median), `growth_1_3x`
+(radius above 1.3 times the smallest radius below it), `radius_below_0_04m`,
+`too_few_points` (fewer than three points) or `no_fit` (RANSAC found no circle).
+Upstream applies the growth and minimum-radius rules from the second slice on, so the lowest slice is never set aside by them.
+
 Inventory rows include source `x`, `y`, `z` and WGS84 `longitude`, `latitude`.
 DBH measurement status uses `dbh_quality_code` and `dbh_quality_label`.
 If species predictions are present, `--species-lookup lookup.tsv` can add names

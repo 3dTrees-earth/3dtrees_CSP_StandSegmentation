@@ -143,6 +143,7 @@ filter_inventory_to_aoi <- function(inventory, aoi, crs) {
 
 # One upstream forest_inventory() call; returns one row per tree or NULL.
 # Upstream simplifies a one-tree result to an 8x1 frame keyed by row names.
+# With DBH evidence on, the slice circles ride along as attribute "dbh_slices".
 upstream_inventory <- function(las, instance, config) {
   measured <- tryCatch(
     CspStandSegmentation::forest_inventory(
@@ -154,7 +155,8 @@ upstream_inventory <- function(las, instance, config) {
       max_dbh = config$max_dbh,
       n_cores = config$geometry_threads,
       tree_id_col = instance,
-      non_tree_id = config$non_tree_ids
+      non_tree_id = config$non_tree_ids,
+      return_evidence = evidence_enabled(config)
     ),
     error = function(error) {
       warning(sprintf("Inventory measurements failed for %s: %s", instance, conditionMessage(error)))
@@ -162,6 +164,7 @@ upstream_inventory <- function(las, instance, config) {
     }
   )
   if (is.null(measured) || !nrow(measured)) return(NULL)
+  slices <- attr(measured, "dbh_slices")
   if (!instance %in% names(measured) && ncol(measured) == 1L) {
     values <- stats::setNames(as.numeric(measured[[1L]]), rownames(measured))
     measured <- data.table::as.data.table(as.list(values))
@@ -169,6 +172,7 @@ upstream_inventory <- function(las, instance, config) {
   if (!instance %in% names(measured)) return(NULL)
   measured <- data.table::as.data.table(measured)
   data.table::setnames(measured, instance, "instance_id")
+  if (!is.null(slices)) data.table::setattr(measured, "dbh_slices", slices)
   measured
 }
 
@@ -199,8 +203,12 @@ measure_tree <- function(points, instance, id, config) {
     set.seed((seed + run - 1L) %% .Machine$integer.max)
     suppressMessages(upstream_inventory(las, instance, config))
   })
+  slices <- lapply(fits, function(fit) if (is.null(fit)) NULL else attr(fit, "dbh_slices"))
   fits <- data.table::rbindlist(fits, use.names = TRUE, fill = TRUE)
-  if (!nrow(fits)) return(NULL)
+  if (!nrow(fits)) {
+    record_tree_evidence(config, instance, id, seed, fits, slices, 0L, points)
+    return(NULL)
+  }
   fitted <- which(is.finite(fits$DBH))
   chosen <- if (length(fitted) * 2L > nrow(fits)) {
     fitted[order(fits$DBH[fitted])][(length(fitted) + 1L) %/% 2L]
@@ -214,6 +222,7 @@ measure_tree <- function(points, instance, id, config) {
   result[, `:=`(Height = fits$Height[[1L]], ConvexHullArea = fits$ConvexHullArea[[1L]],
                 dbh_runs = nrow(fits), dbh_runs_fitted = length(fitted),
                 dbh_spread_m = if (length(fitted)) diff(range(fits$DBH[fitted])) else NA_real_)]
+  record_tree_evidence(config, instance, id, seed, fits, slices, chosen, points)
   result
 }
 
@@ -465,6 +474,7 @@ finish_large_instance_summary <- function(state, id, spec, aoi, crs, config,
   # The stem position replaces the sample median only when a DBH was fitted.
   located <- !is.null(dbh) && is.finite(dbh$dbh_m)
   crown <- if (is.null(state$crown_hull)) state$hull else state$crown_hull
+  record_crown_hull(config, spec$instance, id, crown$x, crown$y, 2L)
   result <- data.table::data.table(
     segmentation_source = spec$source, instance_dimension = spec$instance,
     instance_id = as.numeric(id),

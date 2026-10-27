@@ -1,5 +1,5 @@
 .csp_workflow_dir <- dirname(normalizePath(sys.frame(1)$ofile, mustWork = TRUE))
-for (.csp_module in c("inventory_policy.R", "instance_inventory.R", "partition_inventory.R", "owned_inventory.R",
+for (.csp_module in c("inventory_policy.R", "dbh_evidence.R", "instance_inventory.R", "partition_inventory.R", "owned_inventory.R",
                       "inventory_readers.R", "inventory_run.R")) {
   source(file.path(.csp_workflow_dir, .csp_module), local = TRUE)
 }
@@ -633,6 +633,11 @@ run_tool <- function(config) {
   published <- FALSE
   on.exit(if (!published) unlink(stage_dir, recursive = TRUE, force = TRUE), add = TRUE)
 
+  if (isTRUE(config$dbh_evidence)) {
+    config$dbh_evidence_dir <- file.path(stage_dir, ".dbh-evidence")
+    dir.create(config$dbh_evidence_dir)
+  }
+
   if (!config$enable_csp) {
     resources <- run_chunked_inventory(config, files, stage_dir, output_parent, started)
     publish_stage(stage_dir, config$output_dir)
@@ -708,6 +713,7 @@ run_tool <- function(config) {
     inventories[[slug]] <- result
   }
   exports <- write_outputs(inventories, area, stage_dir, config, las_crs)
+  exports$artifacts <- c(exports$artifacts, write_dbh_evidence(stage_dir, inventories, config, las_crs))
 
   metadata <- list(
     tool = "3Dtrees: CSP StandSegmentation",

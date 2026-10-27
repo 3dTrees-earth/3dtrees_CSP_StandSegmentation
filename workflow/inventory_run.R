@@ -42,6 +42,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
   message(sprintf("CSP workflow: inventory ready in %.1f s; exporting", inventory_elapsed_seconds))
   export_started <- Sys.time()
   exports <- write_outputs(inventories, area, stage_dir, config, las_crs)
+  exports$artifacts <- c(exports$artifacts, write_dbh_evidence(stage_dir, inventories, config, las_crs))
   export_elapsed_seconds <- as.numeric(difftime(Sys.time(), export_started, units = "secs"))
 
   metadata <- c(list(

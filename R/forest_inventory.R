@@ -224,6 +224,9 @@ ransac_circle_fit <- function(data,n_iterations = 1000L,distance_threshold = 0.0
 #' @param use_stem_segmentation logical whether to use only points classified as stem for DBH estimation
 #' @param semantic_colname character name of the semantic segmentation column (only needed if use_stem_segmentation is TRUE)
 #' @param stem_semantic_label integer semantic label value for stem points (only needed if use_stem_segmentation is TRUE)
+#' @param return_evidence logical; if TRUE the result carries a `dbh_slices` attribute with
+#'   every slice circle the DBH was derived from (raw fit, the quality rule that rejected
+#'   it, and the spline at the slice). The fit and all returned values are unchanged.
 #'
 #' @returns a data.frame with the TreeID, X, Y, DBH, quality_flag, Height and ConvexHullArea
 #'
@@ -252,7 +255,8 @@ forest_inventory <- function(las,
                              non_tree_id = 0,
                              use_stem_segmentation = FALSE,
                              semantic_colname = NULL,
-                             stem_semantic_label = NULL) {
+                             stem_semantic_label = NULL,
+                             return_evidence = FALSE) {
 
   # Temporarily disable data.table progress
   old_opt <- options(datatable.showProgress = FALSE)
@@ -343,7 +347,31 @@ forest_inventory <- function(las,
     )$circle
   }
 
+  # Evidence only: the points .fit_circle() hands to RANSAC. Deterministic, no RNG.
+  .fit_point_count <- function(slice) {
+    if (nrow(slice) < 3) return(0L)
+    if (nrow(slice) < 100 | use_stem_segmentation) return(nrow(slice))
+    q <- min(0.99, 1 - sqrt(100 / nrow(slice)) + 0.05)
+    nrow(slice[Planarity  > quantile(Planarity,  q, na.rm = TRUE) &
+                 Verticality > quantile(Verticality, q, na.rm = TRUE)])
+  }
+
   .fit_circles <- function(tree) {
+    if (return_evidence) {
+      return(tree[slices,
+           on = .(Z >= z_lo, Z < z_hi),{
+             pars <- .fit_circle(.SD)
+             .(
+               r = pars[3L],
+               X = pars[1L],
+               Y   = pars[2L],
+               n_points = sum(!is.na(X)),
+               n_fit_points = .fit_point_count(.SD)
+             )
+           },
+           by = .EACHI,
+           .SDcols = c("X", "Y", "Planarity", "Verticality")])
+    }
     tree[slices,
          on = .(Z >= z_lo, Z < z_hi),{
            pars <- .fit_circle(.SD)
@@ -371,12 +399,29 @@ forest_inventory <- function(las,
     # calculate mean dbh height
     Z <- mean(tree$Zref - tree$Znorm) + 1.3
 
+    # Evidence only: the raw fits and why the quality rules drop a slice.
+    if (return_evidence) {
+      evidence <- data.table::data.table(
+        slice_id = slices$slice_id, z_lo_m = slices$z_lo, z_hi_m = slices$z_hi,
+        ground_z = Z - 1.3, n_points = t_seq$n_points, n_fit_points = t_seq$n_fit_points,
+        circle_x = t_seq$X, circle_y = t_seq$Y, radius_m = t_seq$r,
+        status = ifelse(t_seq$n_points < 3, "too_few_points",
+                        ifelse(is.na(t_seq$r), "no_fit", "fitted")),
+        spline_x = NA_real_, spline_y = NA_real_, spline_r = NA_real_)
+      on.exit(collected$slices <- evidence, add = TRUE)
+    }
+
     # quality control: remove unrealistic large circles
     t_seq$r[abs(t_seq$r - median(t_seq$r, na.rm = TRUE)) > 2 * sd(t_seq$r, na.rm = TRUE)] <- NA
+    if (return_evidence) evidence[status == "fitted" & is.na(t_seq$r), status := "outlier_2sd"]
 
     # quality control: check if circles do not get way larger allong the trunk
     for (s in 2:nrow(t_seq)) {
       if (.na2true(t_seq$r[s] > suppressWarnings(min(t_seq$r[1:(s -1)], na.rm = TRUE) * 1.3)) | .na2true(t_seq$r[s] < 0.04) | all(is.na(t_seq$r[1:s]))) {
+        if (return_evidence && !is.na(t_seq$r[s])) {
+          data.table::set(evidence, s, "status",
+                          if (t_seq$r[s] < 0.04) "radius_below_0_04m" else "growth_1_3x")
+        }
         t_seq[s, c("X", "Y", "r")] <- NA
       }
     }
@@ -399,6 +444,12 @@ forest_inventory <- function(las,
     ], smooth.spline(Zmin, X, df = 20)))
     spline_y <- suppressWarnings(with(t_seq[!is.na(t_seq$Y),
     ], smooth.spline(Zmin, Y, df = 20)))
+    if (return_evidence) {
+      # Same abscissa (slice lower edge) the DBH prediction below uses.
+      data.table::set(evidence, j = "spline_x", value = predict(spline_x, evidence$z_lo_m)$y)
+      data.table::set(evidence, j = "spline_y", value = predict(spline_y, evidence$z_lo_m)$y)
+      data.table::set(evidence, j = "spline_r", value = predict(spline_r, evidence$z_lo_m)$y)
+    }
     # predict DBH X and Y at DBH height
     r <- as.numeric(predict(spline_r, 1.3+0.5*increment)$y)
     x <- as.numeric(predict(spline_x, 1.3+0.5*increment)$y)
@@ -413,8 +464,16 @@ forest_inventory <- function(las,
     }
   }
 
+  # Evidence collector, an environment so the data.table groups can write to it.
+  collected <- new.env()
+  collected$trees <- list()
   dbh_results <- dbh_slice@data[,{
+    collected$slices <- NULL
     pars <- .spline_predict(.SD)
+    if (return_evidence && !is.null(collected$slices)) {
+      collected$trees[[length(collected$trees) + 1L]] <-
+        cbind(data.table::data.table(tree_id = .BY[[1L]]), collected$slices)
+    }
     .(
       X = pars[1L],
       Y = pars[2L],
@@ -444,6 +503,9 @@ forest_inventory <- function(las,
   dbh_results <- merge(dbh_results, heights, by = tree_id_col)
   dbh_results <- merge(dbh_results, cpa, by = tree_id_col)
   dbh_results <- data.frame(apply(dbh_results, 2, unlist))
+  if (return_evidence) {
+    attr(dbh_results, "dbh_slices") <- data.table::rbindlist(collected$trees)
+  }
   return(dbh_results)
 }
 

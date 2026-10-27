@@ -122,6 +122,8 @@ usage <- function() {
     "  --dbh-band-points N                Stem-band points kept per tree for DBH; above it",
     "                                     points are merged from 1 mm voxels up (default: 1000000)",
     "  --dbh-runs N                       Upstream DBH fits per tree; the median is reported (default: 5)",
+    "  --dbh-evidence true|false          Also write dbh/dbh_slices, dbh/dbh_runs and dbh/crown_hulls",
+    "                                     as CSV and Parquet (default: false)",
     "  --scratch-dir DIR                  Intermediate files (default: $TMPDIR, else next to output)",
     sep = "\n"
   )
@@ -179,6 +181,7 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     max_dbh = 1,
     dbh_band_points = inventory_dbh_band_point_budget,
     dbh_runs = 5L,
+    dbh_evidence = FALSE,
     scratch_dir = NULL
   )
 
@@ -252,6 +255,7 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--max-dbh") config$max_dbh <- parse_number(value, key, 0.001)
     else if (key == "--dbh-band-points") config$dbh_band_points <- parse_number(value, key, 1000, 100000000, TRUE)
     else if (key == "--dbh-runs") config$dbh_runs <- parse_number(value, key, 1, 99, TRUE)
+    else if (key == "--dbh-evidence") config$dbh_evidence <- parse_bool(value, key)
     else if (key == "--scratch-dir") config$scratch_dir <- value
     else abort(sprintf("Unknown option: %s", key))
   }

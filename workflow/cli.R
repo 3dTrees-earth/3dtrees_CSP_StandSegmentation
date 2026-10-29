@@ -27,13 +27,15 @@ parse_non_tree_ids <- function(value) {
   unique(parsed)
 }
 
+# Parquet (GeoParquet for vectors) is always written; the list adds CSV, TSV,
+# JSON and/or GeoPackage copies for standalone and Galaxy use.
 parse_output_formats <- function(value) {
   formats <- unique(tolower(trimws(strsplit(value, ",", fixed = TRUE)[[1L]])))
-  supported <- c("csv", "tsv", "json", "gpkg")
+  supported <- c("parquet", "csv", "tsv", "json", "gpkg")
   if (!length(formats) || any(!formats %in% supported)) {
-    abort("--output-formats must contain csv, tsv, json, and/or gpkg")
+    abort("--output-formats must contain parquet, csv, tsv, json, and/or gpkg")
   }
-  formats
+  unique(c("parquet", formats))
 }
 
 validate_dimension <- function(value, label) {
@@ -79,7 +81,9 @@ usage <- function() {
     "  --seed-file TSV                    X/Y/Z/TreeID table for supplied seeds",
     "  --aoi-json GEOJSON                 Optional AOI in the point-cloud CRS",
     "  --dtm GEOTIFF                      Use this DTM; otherwise generate one",
-    "  --output-formats LIST              csv,tsv,json,gpkg (default: all four)",
+    "  --output-formats LIST              parquet[,csv,tsv,json,gpkg] (default: parquet). Parquet",
+    "                                     (GeoParquet for crown hulls) is always written; add csv",
+    "                                     (or tsv, json, gpkg) for copies of the same tables",
     "  --species-lookup TSV               Species names and taxonomy/model versions",
     "  --dtm-resolution METRES            DTM cell size (default: 0.2)",
     "  --read-chunk-size METRES            Spatial DTM/inventory tile size (default: 300)",
@@ -123,7 +127,7 @@ usage <- function() {
     "                                     points are merged from 1 mm voxels up (default: 1000000)",
     "  --dbh-runs N                       Upstream DBH fits per tree; the median is reported (default: 5)",
     "  --dbh-evidence true|false          Write dbh/dbh_slices, dbh/dbh_runs and dbh/crown_hulls",
-    "                                     as CSV and Parquet (default: true)",
+    "                                     as Parquet, plus any csv/tsv/json copies (default: true)",
     "  --scratch-dir DIR                  Intermediate files (default: $TMPDIR, else next to output)",
     sep = "\n"
   )
@@ -141,7 +145,7 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     seed_file = NULL,
     aoi_json = NULL,
     dtm = NULL,
-    output_formats = c("csv", "tsv", "json", "gpkg"),
+    output_formats = "parquet",
     species_lookup = NULL,
     dtm_resolution = 0.2,
     read_chunk_size = 300,

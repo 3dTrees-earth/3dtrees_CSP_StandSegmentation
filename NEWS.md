@@ -1,5 +1,9 @@
 # Unreleased (3Dtrees fork)
 
+## Breaking changes
+
+-   CLI (`exec/run.R`): every table is now written as Parquet and the DBH crown hulls as GeoParquet 1.1; `--output-formats` defaults to `parquet` (it was `csv,tsv,json,gpkg`). Parquet is always written; `csv`, `tsv`, `json` and `gpkg` add copies of the same tables. Pass `--output-formats parquet,csv,tsv,json,gpkg` for the previous file set. Tables are sorted by `(instance_dimension, instance_id)` and Parquet row groups hold at most 16,384 rows.
+
 ## Bug fixes
 
 -   `forest_inventory()`: a rejected stem fit (spline position more than 5 m off) returned four values instead of five, so its quality flag (3) was reported as a DBH of 3 m. It now returns DBH = NA with quality flag 3.

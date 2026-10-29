@@ -17,7 +17,7 @@ dtm <- terra::rast(xmin = floor(min(cloud$X)) - 1, xmax = ceiling(max(cloud$X)) 
 terra::values(dtm) <- 2
 dtm_path <- file.path(work, "dtm.tif")
 terra::writeRaster(dtm, dtm_path)
-config <- parse_cli_args(c("--input", input, "--output-dir", file.path(work, "owned"),
+config <- parse_cli_args(c("--input", input, "--output-dir", file.path(work, "owned"), "--output-formats", "parquet,csv,tsv,json,gpkg",
                           "--segmentation-spec", "PredInstance_FM,species_id_FM,species_prob_FM",
                           "--segmentation-spec", "PredInstance_SAT,species_id_FM,species_prob_FM",
                           "--segmentation-spec", "PredInstance_ULS", "--dtm", dtm_path,
@@ -51,7 +51,7 @@ for (spec in config$segmentation_specs) {
 manifest <- jsonlite::fromJSON(file.path(config$output_dir, "manifest.json"), simplifyVector = FALSE)
 stopifnot(setequal(vapply(manifest$artifacts, `[[`, character(1), "key"),
                    setdiff(list.files(config$output_dir, recursive = TRUE), "manifest.json")))
-stopifnot(all(c("csv", "tsv", "json", "gpkg") %in% vapply(manifest$artifacts, `[[`, character(1), "format")))
+stopifnot(all(c("parquet", "csv", "tsv", "json", "gpkg") %in% vapply(manifest$artifacts, `[[`, character(1), "format")))
 
 # Compare deterministic metrics against the existing partition implementation.
 baseline_config <- config

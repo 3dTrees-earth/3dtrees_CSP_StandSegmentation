@@ -59,7 +59,7 @@ Rscript exec/run.R \
   --segmentation-spec PredInstance_FM,species_id_FM,species_prob_FM \
   --enable-csp false \
   --dtm existing_dtm.tif \
-  --output-formats csv,tsv,json,gpkg \
+  --output-formats parquet,csv \
   --dtm-resolution 0.2 \
   --random-seed 42
 ```
@@ -71,7 +71,7 @@ table is empty. Run `Rscript exec/run.R --help` for all controls.
 
 Common controls are the merged COPC input, repeatable segmentation specs, non-tree IDs,
 optional CSP and seed source, optional native-CRS AOI GeoJSON, an optional DTM,
-selected output formats, DTM resolution (default 0.2 m when generated), and random seed.
+optional CSV/TSV/JSON/GeoPackage copies of the Parquet tables, DTM resolution (default 0.2 m when generated), and random seed.
 The source point cloud must declare a projected metre CRS. The CLI can recover
 the CRS from a valid extended WKT record when a COPC file has a truncated
 ordinary WKT record, and rejects conflicting valid records. A supplied DTM must
@@ -85,32 +85,141 @@ Fine-tuning controls retain upstream defaults,
 including a 0.3 m CSP voxel and one routing worker. CSP geometry features are
 computed only when a non-zero geometry weight requires them.
 
-All four table formats are written by default; `--output-formats` can select any
-combination. Outputs include:
+### Outputs
 
-- `dtm_full.tif` and optional `dtm_aoi.tif`;
-- one CSV, TSV, and/or JSON per instance dimension plus combined Inventory,
-  Species, Stand Summary, Validation, and Issues tables in each selected format;
-- `inventory.gpkg` when selected, with one 3D point layer per segmentation and
-  those five attribute tables;
-- `manifest.json` with version, artifact keys, fields and units, source/WGS84
-  coordinate metadata, segmentation dimensions, and DTM metadata;
-- `effective_seeds.tsv` and `segmented_csp.laz` only when CSP is enabled;
-- `run_metadata.json` and `resource_summary.json`.
+**Every table is written as Parquet, and every vector as GeoParquet.** These
+are the files the 3Dtrees platform and viewer read. CSV, GeoJSON and
+GeoPackage downloads are made from them by the platform at download time, so
+a platform run needs no other format. Standalone and Galaxy users can ask for
+copies of the same tables:
 
-JSON table exports retain double-precision coordinates so the selected formats
-describe the same tree positions.
+`--output-formats LIST` takes `parquet`, `csv`, `tsv`, `json` and `gpkg`
+(default: `parquet`). Parquet is always written, whether or not the list
+names it. Each other entry adds a copy of every table in that format. For
+example, `--output-formats csv` writes Parquet plus CSV, and `--output-formats
+parquet,csv,tsv,json,gpkg` writes everything the tool wrote by default before
+Parquet became the default. The copies hold the same rows, columns, order and
+values as the Parquet files (`tests/tool/test_parquet_outputs.R` asserts this).
 
-Every run also writes, as CSV and Parquet, the evidence each DBH and crown area
-was computed from; `--dbh-evidence false` switches it off. The fit and every
-other output stay byte-identical either way; nothing here feeds back into a
-measurement.
+| File | Format | Written | One row per |
+| --- | --- | --- | --- |
+| `inventory_combined.parquet` | Parquet | always | tree, all segmentations |
+| `inventories/<SOURCE>.parquet` | Parquet | always | tree of one segmentation (`SAT`, `FM`, `CSP`, ...) |
+| `stand_summary.parquet` | Parquet | always | segmentation |
+| `species.parquet` | Parquet | always | segmentation × species |
+| `validation.parquet` | Parquet | always | segmentation |
+| `issues.parquet` | Parquet | always | issue (empty table when there are none) |
+| `dbh/dbh_slices.parquet` | Parquet | `--dbh-evidence true` (default) | tree × stem slice of the reported run |
+| `dbh/dbh_runs.parquet` | Parquet | `--dbh-evidence true` | tree × DBH run |
+| `dbh/crown_hulls.parquet` | GeoParquet 1.1 | `--dbh-evidence true` | tree (crown hull polygon) |
+| same stems with `.csv` / `.tsv` / `.json` | text copies | `csv` / `tsv` / `json` in `--output-formats` | as the Parquet file |
+| `inventory.gpkg` | GeoPackage | `gpkg` in `--output-formats` | one 3D point layer `inventory_<SOURCE>` per segmentation, plus the five attribute tables above (not the DBH evidence) |
+| `dtm_full.tif`, `dtm_aoi.tif` | GeoTIFF | always; AOI raster only with `--aoi-json` | DTM (supplied or generated) |
+| `manifest.json` | JSON | always | artifact keys and formats, fields and units, coordinate reference, segmentations, DTM |
+| `run_metadata.json`, `resource_summary.json` | JSON | always | run settings, timings and memory |
+| `effective_seeds.tsv`, `segmented_csp.laz` | TSV, LAZ | only with `--enable-csp true` | CSP seed / point |
+| `instance_index.json` | JSON | only from `--inventory-read-mode copc-owned` | instance index |
+
+**Row order and row groups.** Every table is sorted by
+`(instance_dimension, instance_id)` where it has those columns, then by
+`slice_id` (DBH slices), `run` (DBH runs) or `species_id` (species). Strings
+sort in C (byte) order, so `PredInstance_FM` comes before `PredInstance_SAT`.
+The text copies use the same order. Parquet files are written in row groups of
+at most 16,384 rows with min/max statistics, snappy-compressed. A reader can
+therefore fetch one tree, or a range of trees, by reading only the row groups
+whose `instance_dimension`/`instance_id` range covers it, without downloading
+the whole file. `manifest.json` records `sorted_by` and `row_group_rows` for
+every Parquet artifact.
+
+**Types.** Parquet columns keep the R types: numbers as `double` or `int32`,
+logical values as `bool`, text as `string`, and `NA` as null. The DBH evidence
+columns have fixed types, so a column that happens to be empty in one run
+(no spline, no fitted DBH) keeps the same type as in every other run. In the
+CSV/TSV copies (`data.table::fwrite`), `NA` is an empty field, an empty string
+is `""`, booleans are `TRUE`/`FALSE`, and doubles are printed to 15
+significant digits. Parquet keeps the full double, so use Parquet when exact
+values matter. JSON copies keep full double precision and write `NA` as `null`.
+
+**GeoParquet.** `dbh/crown_hulls.parquet` stores each hull as WKB in a
+`geometry` column, in the column position the CSV uses for `wkt`. The CRS is
+the source point-cloud CRS, given as PROJJSON in the GeoParquet 1.1 `geo`
+schema metadata with `geometry_types: ["Polygon"]` and the bbox. GDAL ≥ 3.8
+with the Parquet driver, GeoPandas, DuckDB spatial and the R `arrow` package
+read it directly. (The `sfarrow` R package expects the older 0.1 metadata and
+does not pick up the CRS.)
+
+**Getting CSV.** From a platform run, download the tables as CSV in 3Dtrees;
+the platform converts the Parquet files at download time. For a local run, add
+`--output-formats csv` (or `csv,tsv,json,gpkg`). To convert an existing
+Parquet output yourself:
+
+```r
+x <- arrow::read_parquet("inventory_combined.parquet")
+data.table::fwrite(x, "inventory_combined.csv", na = "")
+```
+
+This reproduces the tool's CSV byte for byte (crown hulls need their WKB
+`geometry` turned back into `wkt` first). `ogr2ogr -f CSV -lco GEOMETRY=AS_WKT
+crown_hulls.csv crown_hulls.parquet` does the same for the hulls with a
+Parquet-enabled GDAL.
+
+To read a single tree by range in R:
+
+```r
+library(arrow); library(dplyr)
+open_dataset("dbh/dbh_slices.parquet") |>
+  filter(instance_dimension == "PredInstance_FM", instance_id == 42) |>
+  collect()
+```
+
+#### Inventory columns (`inventory_combined`, `inventories/<SOURCE>`)
+
+Units are also listed per field in `manifest.json`.
+
+| Column | Unit | Meaning |
+| --- | --- | --- |
+| `segmentation_source` | | Short segmentation name (`SAT`, `FM`, `CSP`, ...): the instance dimension without `PredInstance_` |
+| `instance_dimension` | | LAS dimension holding the tree IDs; the Potree attribute to filter by |
+| `instance_id` | | Tree ID in that dimension |
+| `x`, `y`, `z` | m (source CRS) | Tree position from the DBH measurement; median x/y and lowest z of the tree's points when no DBH was measured |
+| `longitude`, `latitude` | degree (WGS84) | `x`, `y` transformed to EPSG:4326 |
+| `dbh_m` | m | Diameter at breast height (median of the DBH runs); null when unavailable |
+| `height_m` | m | Tree height above the DTM |
+| `convex_hull_area_m2` | m² | Crown convex-hull area |
+| `point_count` | | Points in the tree |
+| `species_id`, `species_prob` | | Modal species ID and median probability of the points with that ID (only with species dimensions) |
+| `species_conflict_fraction` | | Share of the tree's points with another species ID |
+| `scientific_name`, `common_name`, `taxonomy_version`, `model_version` | | From `--species-lookup`, when supplied |
+| `pred_score_fm`, `pred_score_mixed` | | Median `PredScore_FM` and whether scores differ within the tree (FM, only with `--inventory-attributes PredScore_FM`) |
+| `wood_point_count`, `leaf_point_count`, `wood_share`, `leaf_share` | | From `PredSemantic_FM` (FM, only with `--inventory-attributes PredSemantic_FM`) |
+| `dbh_quality_code`, `dbh_quality_label` | | 1 `too_few_stem_slice_points`, 2 `fallback_circle_estimate`, 3 `rejected_or_unstable_fit`, 4 `spline_fit`, 9 no measurement; the label is `dbh_unavailable` whenever `dbh_m` is null |
+| `dbh_runs`, `dbh_runs_fitted`, `dbh_spread_m` | –, –, m | DBH runs made, runs that produced a DBH, and max − min of their DBH values |
+| `dbh_band_points`, `dbh_band_source_points`, `dbh_band_voxel_m` | –, –, m | Stem-band points used for DBH, available, and the thinning voxel (0 when not thinned) |
+| `inventory_method` | | `standard` or `streaming_large_instance` |
+
+The combined inventory has the union of the per-segmentation columns; a column
+that a segmentation does not produce is null for its rows.
+
+#### Other tables
+
+| Table | Columns |
+| --- | --- |
+| `stand_summary` | `segmentation_source`, `instance_dimension`, `area_source` (`aoi` or `point_cloud_convex_hull`), `area_m2` (m²), `tree_count`, `dbh_measured_tree_count`, `dbh_coverage_fraction`, `trees_per_ha` (trees/ha), `basal_area_m2_per_ha` (m²/ha; null unless every tree has a DBH), `mean_dbh_m`, `median_dbh_m`, `dbh_p05_m`, `dbh_p25_m`, `dbh_p75_m`, `dbh_p95_m`, `mean_height_m`, `median_height_m`, `height_p05_m`, `height_p25_m`, `height_p75_m`, `height_p95_m` (m) |
+| `species` | `segmentation_source`, `instance_dimension`, `species_id`, `tree_count`, `tree_proportion`, plus the lookup columns when `--species-lookup` is supplied |
+| `validation` | `segmentation_source`, `instance_dimension`, `tree_count`, `dbh_unavailable_count` |
+| `issues` | `severity` (`info`, `warning`), `code`, `segmentation_source`, `instance_dimension`, `instance_id`, `message`; codes are `streaming_large_instance`, `dbh_band_thinned` and `species_lookup_missing` |
+
+#### DBH evidence (`dbh/`)
+
+Every run also writes the evidence each DBH and crown area was computed from;
+`--dbh-evidence false` switches it off. The fit and every other output stay
+byte-identical either way; nothing here feeds back into a measurement.
 
 | File | One row per | Columns |
 | --- | --- | --- |
-| `dbh/dbh_slices.*` | tree × stem slice of the reported (median) run | `instance_dimension`, `instance_id`, `run`, `slice_id`, `z_lo_m`, `z_hi_m` (above the DTM), `ground_z` (m, source CRS), `n_points`, `n_fit_points` (points handed to RANSAC), `circle_x`, `circle_y`, `radius_m` (raw fit), `status`, `spline_x`, `spline_y`, `spline_r` (the smoothing splines at the slice's lower edge, the abscissa the 1.3 m prediction uses; empty when no spline was fitted) |
-| `dbh/dbh_runs.*` | tree × DBH run | `run`, `seed`, `dbh_m`, `quality_code`, `reported` |
-| `dbh/crown_hulls.*` | tree | `vertex_count` and the convex hull polygon (`wkt` in the CSV, GeoParquet 1.1 WKB geometry in the source CRS) of the points above 0.5 m, or of all points when fewer than three are |
+| `dbh/dbh_slices.*` | tree × stem slice of the reported (median) run | `instance_dimension`, `instance_id`, `run`, `slice_id`, `z_lo_m`, `z_hi_m` (above the DTM), `ground_z` (m, source CRS), `n_points`, `n_fit_points` (points handed to RANSAC), `circle_x`, `circle_y`, `radius_m` (raw fit), `status`, `spline_x`, `spline_y`, `spline_r` (the smoothing splines at the slice's lower edge, the abscissa the 1.3 m prediction uses; null, an empty field in the text copies, when no spline was fitted) |
+| `dbh/dbh_runs.*` | tree × DBH run | `instance_dimension`, `instance_id`, `run`, `seed`, `dbh_m` (m; null when the run fitted none), `quality_code` (as `dbh_quality_code`), `reported` (true for the run whose DBH the inventory reports) |
+| `dbh/crown_hulls.*` | tree | `instance_dimension`, `instance_id`, `vertex_count` and the convex hull polygon of the points above 0.5 m, or of all points when fewer than three are: WKB `geometry` in the source CRS in the GeoParquet file, `wkt` (coordinates to 1 mm) in the text copies |
 
 `status` names the upstream rule that set a slice aside: `fitted`, `outlier_2sd`
 (radius more than two standard deviations from the median), `growth_1_3x`
@@ -118,19 +227,14 @@ measurement.
 `too_few_points` (fewer than three points) or `no_fit` (RANSAC found no circle).
 Upstream applies the growth and minimum-radius rules from the second slice on, so the lowest slice is never set aside by them.
 
-Inventory rows include source `x`, `y`, `z` and WGS84 `longitude`, `latitude`.
-DBH measurement status uses `dbh_quality_code` and `dbh_quality_label`.
 If species predictions are present, `--species-lookup lookup.tsv` can add names
 and taxonomy/model versions. The lookup needs `segmentation_source`,
 `species_id`, `scientific_name`, `taxonomy_version`, and `model_version` columns;
 `common_name` is optional. Missing lookup metadata is reported in the Issues
 table without inventing species names.
 
-Inventory rows include point count, position, height, DBH, crown convex-hull
-area, and an explicit measurement-quality field. ForestMamba inventories also
-include median `PredScore_FM`, a mixed-score flag, and wood/leaf point counts and
-shares when those source dimensions are explicitly selected. Processing is fail-atomic: the final
-output directory is published only after all requested products succeed.
+Processing is fail-atomic: the final output directory is published only after
+all requested products succeed.
 
 Existing-instance inventory keeps upstream's 500 RANSAC iterations but uses a
 quiet, vectorized implementation of the same Pratt circle equations. It also
@@ -434,13 +538,23 @@ python tests/tool/generate_multi_instance_copc.py \
   inst/extdata/beech.las tests/tool/fixtures/multi-instance.copc.laz
 ```
 
-The container test exercises those three instance dimensions, every output
-format alone and together, generated and
+The container test exercises those three instance dimensions, Parquet alone
+and with every copy format alone and together, generated and
 supplied DTMs, and both inventory-only and CSP-enabled execution:
 
 ```bash
 docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
   Rscript tests/tool/test_end_to_end.R
+```
+
+`tests/tool/test_parquet_outputs.R` writes every table as Parquet and CSV/TSV
+and asserts that they hold the same values, column order and types, that rows
+are sorted by instance in row groups of at most 16,384 rows, and that the crown
+hulls are valid GeoParquet 1.1:
+
+```bash
+docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
+  Rscript tests/tool/test_parquet_outputs.R
 ```
 
 
@@ -458,7 +572,9 @@ docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
   statistics, the stand hull and a measurement operation. It owns mode-specific
   metadata and artifacts; the common runner never examines partition paths.
 - `workflow/inventory_run.R` handles shared DTM preparation, exports and run
-  metadata. Legacy spatial grids are allocated only by readers or DTM methods
+  metadata. `workflow/outputs.R` builds the tables and manifest;
+  `workflow/table_formats.R` owns the table order, Parquet/GeoParquet writing
+  and the optional CSV/TSV/JSON copies. Legacy spatial grids are allocated only by readers or DTM methods
   that actually need them. A supplied-DTM COPC run does not allocate that grid.
 
 The September 2026 large-file benchmarks above describe the earlier image and

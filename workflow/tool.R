@@ -1,5 +1,5 @@
 .csp_workflow_dir <- dirname(normalizePath(sys.frame(1)$ofile, mustWork = TRUE))
-for (.csp_module in c("inventory_policy.R", "dbh_evidence.R", "instance_inventory.R", "partition_inventory.R", "owned_inventory.R",
+for (.csp_module in c("inventory_policy.R", "table_formats.R", "dbh_evidence.R", "instance_inventory.R", "partition_inventory.R", "owned_inventory.R",
                       "inventory_readers.R", "inventory_run.R")) {
   source(file.path(.csp_workflow_dir, .csp_module), local = TRUE)
 }

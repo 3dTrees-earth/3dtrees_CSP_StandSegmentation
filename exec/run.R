@@ -18,7 +18,7 @@ if ("--version" %in% commandArgs(trailingOnly = TRUE)) {
   quit(status = 0L)
 }
 
-required_packages <- c("CspStandSegmentation", "data.table", "jsonlite", "lidR", "sf", "terra", "DBI", "RSQLite")
+required_packages <- c("CspStandSegmentation", "data.table", "jsonlite", "lidR", "sf", "terra", "DBI", "RSQLite", "arrow")
 missing_packages <- required_packages[!vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)]
 if (length(missing_packages)) {
   abort(sprintf("Missing required R packages: %s", paste(missing_packages, collapse = ", ")))

@@ -40,7 +40,7 @@ stopifnot(
   identical(config$inventory_workers, 1L),
   identical(config$dtm_workers, 10L),
   identical(config$dtm_strategy, "auto"),
-  identical(config$output_formats, c("csv", "tsv", "json", "gpkg")),
+  identical(config$output_formats, "parquet"),
   identical(config$dtm_candidate_resolution, 0.1),
   identical(config$dtm_streaming_threshold, 50000000L),
   isTRUE(config$dbh_evidence),
@@ -56,8 +56,13 @@ formats_config <- parse_cli_args(c(
   "--output-formats", "gpkg,json"
 ))
 stopifnot(identical(formats_config$dtm, "terrain.tif"),
-          identical(formats_config$output_formats, c("gpkg", "json")))
+          identical(formats_config$output_formats, c("parquet", "gpkg", "json")))
+# Parquet is always written; the list only adds copies.
+stopifnot(identical(parse_output_formats("csv"), c("parquet", "csv")),
+          identical(parse_output_formats("CSV, parquet ,csv"), c("parquet", "csv")),
+          identical(parse_output_formats("parquet"), "parquet"))
 expect_error(parse_output_formats("csv,pdf"), "output-formats")
+expect_error(parse_output_formats(""), "output-formats")
 
 worker_pids <- unlist(parallel_chunk_map(
   as.list(seq_len(4L)),

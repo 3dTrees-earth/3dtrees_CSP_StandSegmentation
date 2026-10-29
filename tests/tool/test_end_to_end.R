@@ -66,6 +66,9 @@ run_case <- function(label, mode, selected, csp = FALSE, chunk_size = 300,
 }
 
 read_inventory <- function(output, slug, format) {
+  if (format == "parquet") return(data.table::as.data.table(arrow::read_parquet(
+    file.path(output, "inventories", paste0(slug, ".parquet"))
+  )))
   if (format == "csv") return(data.table::fread(file.path(output, "inventories", paste0(slug, ".csv"))))
   if (format == "tsv") return(data.table::fread(file.path(output, "inventories", paste0(slug, ".tsv"))))
   if (format == "json") return(data.table::as.data.table(jsonlite::fromJSON(
@@ -77,6 +80,9 @@ read_inventory <- function(output, slug, format) {
 }
 
 read_table <- function(output, table, format) {
+  if (format == "parquet") return(data.table::as.data.table(arrow::read_parquet(
+    file.path(output, paste0(table, ".parquet"))
+  )))
   if (format == "csv") return(data.table::fread(file.path(output, paste0(table, ".csv"))))
   if (format == "tsv") return(data.table::fread(file.path(output, paste0(table, ".tsv"))))
   if (format == "json") return(data.table::as.data.table(jsonlite::fromJSON(
@@ -88,6 +94,8 @@ read_table <- function(output, table, format) {
 }
 
 check_case <- function(output, mode, selected, csp = FALSE) {
+  # Parquet is always written; the selection adds copies.
+  selected <- unique(c("parquet", selected))
   manifest <- jsonlite::fromJSON(file.path(output, "manifest.json"), simplifyVector = FALSE)
   metadata <- jsonlite::fromJSON(file.path(output, "run_metadata.json"))
   segmentations <- if (csp) c(dimensions, CSP = "PredInstance_CSP") else dimensions
@@ -113,7 +121,7 @@ check_case <- function(output, mode, selected, csp = FALSE) {
     stopifnot(!identical(manifest$dtm$source, "supplied"),
               any(is.finite(terra::values(terra::rast(file.path(output, "dtm_full.tif"))))))
   }
-  for (format in formats) {
+  for (format in c("parquet", formats)) {
     for (slug in names(segmentations)) {
       present <- file.exists(file.path(output, "inventories", paste0(slug, ".", format)))
       if (format != "gpkg") stopifnot(identical(present, format %in% selected))
@@ -209,7 +217,8 @@ check_case <- function(output, mode, selected, csp = FALSE) {
 }
 
 for (mode in c("supplied", "generated")) {
-  selections <- c(list(formats), as.list(formats))
+  # "parquet" alone is the default; each other format adds its copies.
+  selections <- c(list(formats), list("parquet"), as.list(formats))
   for (selected in selections) {
     label <- paste(mode, paste(selected, collapse = "-"), sep = "-")
     output <- run_case(label, mode, selected, chunk_size = if (length(selected) == 4L) 10 else 300)
@@ -231,8 +240,8 @@ sequential_metadata <- jsonlite::fromJSON(file.path(sequential, "run_metadata.js
 stopifnot(sequential_metadata$read_chunk_size_m == 10,
           sequential_metadata$spatial_bucket_count > 0)
 data_files <- c(
-  file.path("inventories", paste0(names(dimensions), ".csv")),
-  paste0(tables, ".csv")
+  file.path("inventories", as.vector(outer(names(dimensions), c(".csv", ".parquet"), paste0))),
+  as.vector(outer(tables, c(".csv", ".parquet"), paste0))
 )
 stopifnot(all(vapply(data_files, function(name) {
   identical(unname(tools::md5sum(file.path(spatial, name))),

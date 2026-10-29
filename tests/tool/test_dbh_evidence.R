@@ -36,7 +36,8 @@ plain <- measure_inventory_points(data.table::copy(normalized), spec, config, NU
 
 stage <- tempfile("dbh-evidence-")
 dir.create(stage)
-with_evidence <- modifyList(config, list(dbh_evidence_dir = file.path(stage, ".dbh-evidence")))
+with_evidence <- modifyList(config, list(dbh_evidence_dir = file.path(stage, ".dbh-evidence"),
+                                          output_formats = c("parquet", "csv")))
 dir.create(with_evidence$dbh_evidence_dir)
 set.seed(7)
 recorded <- measure_inventory_points(data.table::copy(normalized), spec, with_evidence, NULL, crs)

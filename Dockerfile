@@ -24,6 +24,7 @@ RUN python3 -m pip install --break-system-packages --no-cache-dir --no-deps \
 RUN python3 -m pip install --break-system-packages --no-cache-dir scipy==1.17.0
 
 RUN install2.r --error --skipinstalled --ncpus -1 \
+        arrow \
         BH \
         RANN \
         RCSF \

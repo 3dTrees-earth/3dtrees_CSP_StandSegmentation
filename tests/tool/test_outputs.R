@@ -56,13 +56,15 @@ stopifnot(summary$dbh_measured_tree_count == 1L,
           summary$dbh_coverage_fraction == 0.5,
           is.na(summary$basal_area_m2_per_ha))
 config <- list(
-  output_formats = c("csv", "tsv", "json", "gpkg"), species_lookup = lookup_path,
+  output_formats = c("parquet", "csv", "tsv", "json", "gpkg"), species_lookup = lookup_path,
   segmentation_specs = list(list(instance = "PredInstance_SAT", source = "SAT",
                                  species = "species_id_SAT", species_prob = "species_prob_SAT"))
 )
 exports <- write_outputs(list(SAT = inventory), list(area_m2 = 10000, area_source = "aoi"),
                          stage, config, crs)
 stopifnot(
+  file.exists(file.path(stage, "inventory_combined.parquet")),
+  file.exists(file.path(stage, "inventories", "SAT.parquet")),
   file.exists(file.path(stage, "inventory_combined.csv")),
   file.exists(file.path(stage, "inventory_combined.tsv")),
   file.exists(file.path(stage, "inventory_combined.json")),
@@ -105,6 +107,15 @@ expect_error(validate_inventory_manifest(invalid, stage), "source EPSG")
 invalid <- written
 invalid$artifacts <- invalid$artifacts[-1L]
 expect_error(validate_inventory_manifest(invalid, stage), "artifact keys")
+parquet_keys <- vapply(written$artifacts, `[[`, character(1), "key")
+stopifnot(all(c("inventory_combined.parquet", "inventories/SAT.parquet") %in% parquet_keys))
+combined_artifact <- written$artifacts[[match("inventory_combined.parquet", parquet_keys)]]
+stopifnot(identical(unlist(combined_artifact$sorted_by), c("instance_dimension", "instance_id")),
+          identical(combined_artifact$row_group_rows, 16384L))
+unlink(file.path(stage, "issues.parquet"))
+invalid <- written
+invalid$artifacts <- Filter(function(artifact) !identical(artifact$key, "issues.parquet"), invalid$artifacts)
+expect_error(validate_inventory_manifest(invalid, stage), "missing a Parquet table")
 
 unlink(work, recursive = TRUE, force = TRUE)
 cat("output contract tests passed\n")

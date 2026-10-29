@@ -46,6 +46,8 @@ jobs:
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_cli.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_outputs.R
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_parquet_outputs.R
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_dbh_evidence.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_rlas_extra_bytes.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_end_to_end.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" python3 -m unittest discover -s tests/tool -p 'test_*.py' -v

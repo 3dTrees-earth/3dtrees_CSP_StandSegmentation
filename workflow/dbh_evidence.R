@@ -53,31 +53,31 @@ record_tree_evidence <- function(config, instance, id, seed, fits, slices, chose
   else record_crown_hull(config, instance, id, points$X, points$Y, 1L)
 }
 
+# Column types are fixed so a table whose column happens to be all-NA in one run
+# (no spline, no fitted run) keeps the same Parquet schema as every other run.
+dbh_evidence_column_classes <- list(
+  character = c("instance_dimension", "status", "wkt"),
+  numeric = c("instance_id", "z_lo_m", "z_hi_m", "ground_z", "circle_x", "circle_y", "radius_m",
+              "spline_x", "spline_y", "spline_r", "dbh_m"),
+  integer = c("run", "slice_id", "n_points", "n_fit_points", "seed", "quality_code", "priority",
+              "vertex_count"),
+  logical = "reported"
+)
+
 read_evidence <- function(directory, table_name) {
   files <- sort(list.files(directory, pattern = sprintf("^%s-[0-9]+[.]csv$", table_name), full.names = TRUE))
   if (!length(files)) return(NULL)
-  data.table::rbindlist(lapply(files, data.table::fread, na.strings = ""), use.names = TRUE, fill = TRUE)
-}
-
-# GeoParquet 1.1 (WKB geometry, PROJJSON CRS) for the hulls; GDAL here has no
-# Parquet driver, so the "geo" schema metadata is written directly.
-write_parquet_table <- function(table, path, crs = NULL) {
-  if (is.null(crs)) return(arrow::write_parquet(table, path))
-  geometry <- sf::st_as_sfc(table$wkt, crs = crs)
-  frame <- as.data.frame(table[, !"wkt"])
-  frame$geometry <- arrow::Array$create(unclass(sf::st_as_binary(geometry)), type = arrow::binary())
-  arrow_table <- arrow::Table$create(frame)
-  bbox <- as.numeric(sf::st_bbox(geometry))
-  geo <- list(version = "1.1.0", primary_column = "geometry", columns = list(geometry = list(
-    encoding = "WKB", geometry_types = list("Polygon"),
-    crs = jsonlite::fromJSON(sf::st_crs(crs)$ProjJson, simplifyVector = FALSE),
-    bbox = if (all(is.finite(bbox))) bbox else NULL)))
-  arrow_table$metadata$geo <- as.character(jsonlite::toJSON(geo, auto_unbox = TRUE, digits = NA, null = "null"))
-  arrow::write_parquet(arrow_table, path)
+  data.table::rbindlist(lapply(files, function(path) {
+    header <- names(data.table::fread(path, nrows = 0L))
+    classes <- lapply(dbh_evidence_column_classes, intersect, header)
+    data.table::fread(path, na.strings = "", colClasses = classes[lengths(classes) > 0L])
+  }), use.names = TRUE, fill = TRUE)
 }
 
 # Keep rows of inventoried trees only (the AOI filter runs after measurement),
-# one row per key, in a stable order; write CSV for people and Parquet for tools.
+# one row per key, sorted by (instance_dimension, instance_id, ...). Parquet
+# (GeoParquet for the hulls) is always written; CSV/TSV/JSON copies follow
+# --output-formats.
 write_dbh_evidence <- function(stage_dir, inventories, config, crs) {
   if (!evidence_enabled(config)) return(list())
   keys <- unique(data.table::rbindlist(lapply(inventories, function(inventory)
@@ -85,33 +85,31 @@ write_dbh_evidence <- function(stage_dir, inventories, config, crs) {
   out_dir <- file.path(stage_dir, "dbh")
   dir.create(out_dir, showWarnings = FALSE)
   layouts <- list(
-    dbh_slices = list(order = c("instance_dimension", "instance_id", "slice_id"), unique = c("instance_dimension", "instance_id", "slice_id")),
-    dbh_runs = list(order = c("instance_dimension", "instance_id", "run"), unique = c("instance_dimension", "instance_id", "run")),
-    crown_hulls = list(order = c("instance_dimension", "instance_id"), unique = c("instance_dimension", "instance_id"))
+    dbh_slices = c("instance_dimension", "instance_id", "slice_id"),
+    dbh_runs = c("instance_dimension", "instance_id", "run"),
+    crown_hulls = c("instance_dimension", "instance_id")
   )
   artifacts <- list()
   for (name in names(layouts)) {
     rows <- read_evidence(config$dbh_evidence_dir, name)
     if (is.null(rows)) next
-    rows[, instance_id := as.numeric(instance_id)]
     rows <- rows[keys, on = c("instance_dimension", "instance_id"), nomatch = NULL]
     if (name == "crown_hulls") {
       data.table::setorderv(rows, c("instance_dimension", "instance_id", "priority"), c(1L, 1L, -1L))
       rows <- rows[, .SD[1L], by = c("instance_dimension", "instance_id")][, !"priority"]
     }
     # A tree measured twice (large-instance remeasurement) keeps its last rows.
-    rows <- unique(rows, by = layouts[[name]]$unique, fromLast = TRUE)
-    data.table::setorderv(rows, layouts[[name]]$order)
+    rows <- unique(rows, by = layouts[[name]], fromLast = TRUE)
+    sorted_by <- sort_by_instance(rows, layouts[[name]])
     if (name == "dbh_slices" && length(setdiff(unique(rows$status), dbh_slice_statuses))) {
       abort("Unknown DBH slice status in evidence")
     }
-    csv <- file.path("dbh", paste0(name, ".csv"))
-    parquet <- file.path("dbh", paste0(name, ".parquet"))
-    data.table::fwrite(rows, file.path(stage_dir, csv), na = "")
-    write_parquet_table(rows, file.path(stage_dir, parquet), if (name == "crown_hulls") crs)
-    artifacts <- c(artifacts, list(
-      list(key = csv, format = "csv", table = name),
-      list(key = parquet, format = "parquet", table = name)))
+    for (format in selected_table_formats(config)) {
+      key <- file.path("dbh", paste0(name, ".", format))
+      write_table_format(rows, file.path(stage_dir, key), format,
+                         if (name == "crown_hulls" && format == "parquet") crs)
+      artifacts[[length(artifacts) + 1L]] <- table_artifact(key, format, name, sorted_by)
+    }
   }
   unlink(config$dbh_evidence_dir, recursive = TRUE)
   artifacts

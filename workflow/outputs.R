@@ -52,15 +52,6 @@ attach_species_metadata <- function(inventory, lookup) {
   merge(inventory, lookup, by = c("segmentation_source", "species_id"), all.x = TRUE, sort = FALSE)
 }
 
-write_table_format <- function(table, path, format) {
-  if (format == "csv") data.table::fwrite(table, path, sep = ",", na = "")
-  else if (format == "tsv") data.table::fwrite(table, path, sep = "\t", na = "")
-  else if (format == "json") {
-    jsonlite::write_json(as.data.frame(table), path, dataframe = "rows", auto_unbox = TRUE,
-                         na = "null", digits = NA, pretty = TRUE)
-  } else abort(sprintf("Unsupported table format: %s", format))
-}
-
 write_gpkg_attribute <- function(connection, name, table) {
   DBI::dbWriteTable(connection, name, as.data.frame(table), overwrite = TRUE)
   DBI::dbExecute(
@@ -176,17 +167,24 @@ write_outputs <- function(inventories, area, stage_dir, config, crs) {
     inventory_combined = combined, species = composition,
     stand_summary = summaries, validation = validation, issues = issues
   )
+  # One row order for every format: by instance (species rows by species_id).
+  inventory_order <- lapply(inventories, sort_by_instance)
+  table_order <- lapply(names(tables), function(name) {
+    sort_by_instance(tables[[name]], if (name == "species") "species_id")
+  })
+  names(table_order) <- names(tables)
   artifacts <- list()
-  for (format in setdiff(config$output_formats, "gpkg")) {
+  for (format in selected_table_formats(config)) {
     for (name in names(inventories)) {
       path <- file.path("inventories", paste0(name, ".", format))
       write_table_format(inventories[[name]], file.path(stage_dir, path), format)
-      artifacts[[length(artifacts) + 1L]] <- list(key = path, format = format, table = "inventory", segmentation = name)
+      artifacts[[length(artifacts) + 1L]] <- table_artifact(path, format, "inventory", inventory_order[[name]],
+                                                            segmentation = name)
     }
     for (name in names(tables)) {
       path <- paste0(name, ".", format)
       write_table_format(tables[[name]], file.path(stage_dir, path), format)
-      artifacts[[length(artifacts) + 1L]] <- list(key = path, format = format, table = name)
+      artifacts[[length(artifacts) + 1L]] <- table_artifact(path, format, name, table_order[[name]])
     }
   }
   layers <- list()
@@ -259,6 +257,12 @@ validate_inventory_manifest <- function(manifest, stage_dir, expected_dimensions
   if (anyDuplicated(keys) || !setequal(keys, actual) ||
       any(!file.exists(file.path(stage_dir, keys))) || !"dtm_full.tif" %in% keys) {
     abort("Inventory manifest contains duplicate or missing artifact keys")
+  }
+  segmentation_slugs <- unique(unlist(lapply(manifest$artifacts, `[[`, "segmentation")))
+  parquet <- c(paste0(required_tables, ".parquet"),
+               file.path("inventories", paste0(segmentation_slugs, ".parquet")))
+  if (!length(segmentation_slugs) || !all(parquet %in% keys)) {
+    abort("Inventory manifest is missing a Parquet table")
   }
   gpkg <- Filter(function(artifact) identical(artifact$format, "gpkg"), manifest$artifacts)
   if (length(gpkg)) {

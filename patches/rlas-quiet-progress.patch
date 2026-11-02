@@ -1,0 +1,22 @@
+--- a/src/readLAS.cpp
++++ b/src/readLAS.cpp
+@@ -28,6 +28,8 @@
+ */
+ 
+ #include <Rcpp.h>
++#include <cmath>
++#include <unistd.h>
+ #include <chrono>
+ #include <string>
+ #include "rlasstreamer.h"
+@@ -57,6 +59,10 @@
+   int width = 50;
+   int pos = static_cast<int>(progress / 100.0 * width);
+ 
++  // A filtered read reports NaN progress, printed as -2147483648 %; a log
++  // file is no terminal, so the carriage-return bar only grows it.
++  if (!std::isfinite(progress) || !isatty(STDOUT_FILENO)) return;
++
+   auto now = std::chrono::steady_clock::now();
+   double elapsed = std::chrono::duration<double>(now - start).count();
+   if (elapsed < 2.0) return;

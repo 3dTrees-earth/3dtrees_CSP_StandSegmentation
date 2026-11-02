@@ -1,3 +1,23 @@
+# Unreleased (3Dtrees fork)
+
+## Breaking changes
+
+-   Inventory: `pred_score_fm` and `pred_score_mixed` are replaced by `pred_score_fm_values`, every distinct `PredScore_FM` of the tree with its point count (JSON), so an instance merged from several FM instances shows all their scores. Large streamed trees are counted over all points, not a sample.
+-   CLI: `--segmentation-spec INSTANCE[,SPECIES,SPECIES_PROB]` is replaced by three options: `--instance-attribute` (repeat per segmentation), and `--species-attribute` and `--species-probability-attribute`, which belong to the `--instance-attribute` before them.
+-   CLI (`exec/run.R`): one inventory table in two files, `inventory.csv` and `inventory.parquet` (same rows and columns, sorted by `(instance_dimension, instance_id)`, Parquet in 2,048-row groups, snappy), plus `stand_summary.csv` with one row per segmentation. Each tree row carries its DBH evidence: `dbh_fits` and `dbh_slices` as JSON arrays and `crown_hull` as WKT, after a `diagnostics` column. The per-segmentation files, the `species`, `validation` and `issues` tables, the `dbh/` folder, `inventory.gpkg` and the `--output-formats` option (TSV/JSON/GeoPackage copies) are gone; species composition and validation counts follow from the inventory and the stand summary.
+-   CLI: `--inventory-read-mode` defaults to `auto` (it was `spatial`). One COPC file is read with `copc-owned` and 8 index workers, one plain LAS/LAZ file with the `sequential` scan; several files and `--enable-csp true` keep `spatial`. The spatial reader ran out of memory on large clouds (40 GB on a 457 M-point COPC crop, 60 GB on a 668 M-point LAZ). Pass `--inventory-read-mode spatial` for the previous reader.
+-   CLI: `--inventory-partitions` defaults to about 3 M points per partition (a power of two from 64 to 4096, from the header point count); it was a fixed 64, which put 10 M points into each partition of a 668 M-point cloud.
+-   CLI: the `sequential` reader accepts plain (non-COPC) LAS/LAZ, and reads the CRS with lidR when the file has no WKT record. Its `read_mode` in `run_metadata.json` is now `sequential_scan_and_instance_partitions`.
+
+## Bug fixes
+
+-   CLI: a generated DTM no longer fails with `[crop] extents do not overlap` when a tile's only points lie in its buffer (seen on a 668 M-point LAZ); such a tile is skipped like an empty one.
+-   Container: the pinned lidR no longer fails with "Internal error in spatial index: point out of range" when a tree's extreme coordinate lies on a 0.1 m multiple that floating point rounds up (4021833.4 m: `floor(x / 0.1) * 0.1` is 4021833.4000000004). The grid bounds now always contain the points (`patches/lidR-grid-bounds.patch`). It stopped the inventory of a 668 M-point cloud after 70 min.
+-   Container: the pinned rlas prints its read progress bar only to a terminal. A filtered (tiled) read reported NaN progress, printed as `-2147483648%`, and the bar grew job logs by megabytes (`patches/rlas-quiet-progress.patch`).
+
+-   `forest_inventory()`: a rejected stem fit (spline position more than 5 m off) returned four values instead of five, so its quality flag (3) was reported as a DBH of 3 m. It now returns DBH = NA with quality flag 3.
+-   `forest_inventory()`: a slice whose planarity or verticality contains NaN (duplicate points in a neighbourhood) no longer aborts the whole tree; NaN values are ignored in the quantile filter.
+
 # CspStandSegmentation 0.2.1
 
 ## New Features and Enhancements

@@ -1,0 +1,24 @@
+--- a/inst/include/lidR/Grid3D.h
++++ b/inst/include/lidR/Grid3D.h
+@@ -91,12 +91,21 @@
+     if (z[i] > zmax) zmax = z[i];
+   }
+ 
++  // floor(v / res) * res can round above v (4021833.4 at res 0.1 gives
++  // 4021833.4000000004), which left the extreme point outside the grid.
++  const double x0 = xmin, x1 = xmax, y0 = ymin, y1 = ymax, z0 = zmin, z1 = zmax;
+   xmin = std::floor(xmin / xres) * xres;
+   xmax = std::ceil (xmax / xres) * xres;
+   ymin = std::floor(ymin / yres) * yres;
+   ymax = std::ceil (ymax / yres) * yres;
+   zmin = std::floor(zmin / zres) * zres;
+   zmax = std::ceil (zmax / zres) * zres;
++  if (xmin > x0) xmin -= xres;
++  if (xmax < x1) xmax += xres;
++  if (ymin > y0) ymin -= yres;
++  if (ymax < y1) ymax += yres;
++  if (zmin > z0) zmin -= zres;
++  if (zmax < z1) zmax += zres;
+ 
+   ncols   = (int64_t)std::floor((xmax - xmin) / xres) + 1;
+   nrows   = (int64_t)std::floor((ymax - ymin) / yres) + 1;

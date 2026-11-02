@@ -1,0 +1,8 @@
+{
+  "schema_version": 2,
+  "instance_point_limit": 2000000,
+  "dbh_band_point_budget": 1000000,
+  "dbh_band_initial_voxel_um": 1000,
+  "large_instance_sample_limit": 100000,
+  "consumer_batch_points": 1000000
+}

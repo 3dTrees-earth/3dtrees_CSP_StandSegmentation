@@ -1,4 +1,4 @@
-# CspStandSegmentation 1.3.0 (3Dtrees fork)
+# CspStandSegmentation 1.0.0 (3Dtrees fork)
 
 ## Breaking changes
 

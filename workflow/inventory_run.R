@@ -25,7 +25,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
   dtm_result <- make_inventory_dtm(files, bounds, config, work_dir, stage_dir)
   if (!is.null(aoi)) {
     aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
-    terra::writeRaster(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"), overwrite = TRUE)
+    write_geotiff(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"))
   }
   dtm_elapsed_seconds <- as.numeric(difftime(Sys.time(), dtm_started, units = "secs"))
   message(sprintf("CSP workflow: DTM ready in %.1f s; preparing inventory reader", dtm_elapsed_seconds))
@@ -52,9 +52,6 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     species_dimensions_supplied = any(vapply(config$segmentation_specs, function(spec) !is.null(spec$species), logical(1))),
     csp_enabled = FALSE, csp_seed_count = 0L, csp_unassigned_point_count = 0L,
     dtm_elapsed_seconds = dtm_elapsed_seconds,
-    inventory_instance_point_limit = inventory_instance_point_limit,
-    inventory_dbh_band_points = config$dbh_band_points,
-    inventory_large_instance_sample_limit = inventory_large_instance_sample_limit,
     inventory_elapsed_seconds = inventory_elapsed_seconds,
     export_elapsed_seconds = export_elapsed_seconds,
     dtm_workers = dtm_result$workers,
@@ -75,7 +72,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     random_seed = config$random_seed, routing_workers = config$routing_workers,
     geometry_threads = config$geometry_threads, voxel_resolution_m = config$voxel_resolution
   ), prepared$metadata, measured$metadata)
-  jsonlite::write_json(metadata, file.path(stage_dir, "run_metadata.json"), auto_unbox = TRUE, pretty = TRUE, na = "null")
+  write_debug_json(config, metadata, file.path(stage_dir, "run_metadata.json"))
   completed <- Sys.time()
   resources <- list(
     elapsed_seconds = as.numeric(difftime(completed, started, units = "secs")),
@@ -85,7 +82,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     geometry_threads = config$geometry_threads,
     note = "Process-local VmHWM only; container/cgroup telemetry is recorded by benchmark runs."
   )
-  jsonlite::write_json(resources, file.path(stage_dir, "resource_summary.json"), auto_unbox = TRUE, pretty = TRUE, na = "null")
+  write_debug_json(config, resources, file.path(stage_dir, "resource_summary.json"))
   write_inventory_manifest(exports, config, las_crs, dtm_result, stage_dir)
   resources
 }

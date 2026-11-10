@@ -492,8 +492,8 @@ forest_inventory <- function(las,
   .convex_hull_area <- function(x, y) {
     if (length(x) < 3L) return(NA_real_)
     idx <- chull(x, y)
-    xx  <- x[idx]
-    yy  <- y[idx]
+    xx  <- x[idx] - x[idx[1L]]  # 3Dtrees: projected coordinates cancel in the shoelace sum
+    yy  <- y[idx] - y[idx[1L]]
     0.5 * abs(sum(xx * c(yy[-1], yy[1]) - yy * c(xx[-1], xx[1])))
   }
 
@@ -592,8 +592,8 @@ forest_inventory_simple <- function(las, slice_min = 1.2, slice_max = 1.4, max_d
   .convex_hull_area <- function(x, y) {
     if (length(x) < 3L) return(NA_real_)
     idx <- chull(x, y)
-    xx  <- x[idx]
-    yy  <- y[idx]
+    xx  <- x[idx] - x[idx[1L]]  # 3Dtrees: projected coordinates cancel in the shoelace sum
+    yy  <- y[idx] - y[idx[1L]]
     0.5 * abs(sum(xx * c(yy[-1], yy[1]) - yy * c(xx[-1], xx[1])))
   }
 

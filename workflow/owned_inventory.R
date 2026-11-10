@@ -18,8 +18,6 @@ index_owned_inventory <- function(files, specs, config, work_dir) {
                  index_workers = config$inventory_index_workers,
                  index_queue_mb = config$inventory_index_queue_mb,
                  core_size = config$inventory_core_size, buffer = config$inventory_buffer,
-                 retained_points = config$inventory_retained_points,
-                 dbh_band_points = config$dbh_band_points,
                  prefetch_mb = config$inventory_prefetch_mb,
                  non_tree_ids = as.list(as.numeric(config$non_tree_ids)),
                  layouts = lapply(names(layouts), function(slug) list(
@@ -35,20 +33,13 @@ index_owned_inventory <- function(files, specs, config, work_dir) {
   xy <- do.call(rbind, index$stand_hull)
   xy <- matrix(as.numeric(xy), ncol = 2L)
   hull <- update_streaming_hull(NULL, xy[, 1L], xy[, 2L])
-  largest <- oversized <- list()
   for (layout in index$layouts) {
     if (!length(layout$instances)) abort(sprintf("No valid instances for %s", layout$slug))
-    counts <- vapply(layout$instances, `[[`, numeric(1), "count")
-    item <- layout$instances[[which.max(counts)]]
-    largest[[layout$slug]] <- list(instance_id = item$id, points = item$count)
-    oversized[[layout$slug]] <- lapply(layout$instances[counts > inventory_instance_point_limit],
-                                      function(item) list(instance_id = item$id, points = item$count))
   }
   loaded <- unique(unlist(lapply(layouts, `[[`, "columns")))
   list(layouts = layouts, point_count = index$input_points, hull = hull,
        loaded_dimensions = loaded, dropped_dimensions = setdiff(inventory_canonical_names(unlist(index$available_dimensions)), loaded),
        decompressed_groups = unlist(index$decompressed_groups),
-       largest_instances = largest, oversized_instances = oversized,
        selectors = "python_copc_owned", source_point_reads = NULL,
        owned_index = index, owned_config = config_path, owned_index_path = index_path,
        work_dir = work_dir)
@@ -61,9 +52,7 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
   ids <- sprintf("%.0f", as.numeric(unlist(plan$ids)))
   expected <- stats::setNames(as.numeric(unlist(plan$counts)), ids)
   observed <- stats::setNames(numeric(length(ids)), ids)
-  large <- expected > inventory_instance_point_limit
-  states <- lapply(expected[large], new_large_instance_summary)
-  retained <- stats::setNames(vector("list", sum(!large)), ids[!large])
+  trees <- stats::setNames(replicate(length(ids), new_tree(), simplify = FALSE), ids)
   if (is.null(audit_path)) audit_path <- file.path(stream$work_dir, sprintf("owned_%s_%06d.json", spec$source, window_index))
   log_path <- paste0(audit_path, ".log")
   command <- owned_reader_command(config, c(
@@ -73,7 +62,7 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
   open <- TRUE
   on.exit(if (open) close(connection), add = TRUE)
   repeat {
-    values <- readBin(connection, numeric(), n = inventory_consumer_batch_points * length(columns), size = 8L, endian = "little")
+    values <- readBin(connection, numeric(), n = inventory_batch_points * length(columns), size = 8L, endian = "little")
     if (!length(values)) break
     if (length(values) %% length(columns)) abort("Truncated owned COPC point stream")
     points <- data.table::as.data.table(matrix(values, ncol = length(columns), byrow = TRUE,
@@ -86,11 +75,7 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
       selected <- points[keep]
       observed[[key]] <- observed[[key]] + nrow(selected)
       if (observed[[key]] > expected[[key]]) abort(sprintf("Excess points for owned instance %s", key))
-      if (large[[key]]) {
-        states[[key]] <- update_large_instance_summary(states[[key]], selected, spec, config)
-      } else {
-        retained[[key]][[length(retained[[key]]) + 1L]] <- selected
-      }
+      trees[[key]] <- add_tree_points(trees[[key]], selected, spec, config)
     }
   }
   status <- close(connection)
@@ -107,12 +92,9 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
   }
   # Only after both reader and consumer agree may measurements be finalized.
   results <- lapply(ids, function(key) {
-    # Worker count and scheduling must not alter stochastic measurements.
-    set.seed(instance_inventory_seed(config$random_seed, spec$instance, key))
-    if (large[[key]]) return(finish_large_instance_summary(states[[key]], key, spec, aoi, crs, config))
-    points <- data.table::rbindlist(retained[[key]], use.names = TRUE)
-    retained[[key]] <<- NULL
-    measure_inventory_points(points, spec, config, aoi, crs)
+    tree <- trees[[key]]
+    trees[[key]] <<- NULL
+    finish_tree(tree, as.numeric(key), spec, config, aoi, crs)
   })
   audit$r_observed_counts <- as.list(unname(observed))
   audit$r_peak_rss_kb <- process_peak_rss_kb()

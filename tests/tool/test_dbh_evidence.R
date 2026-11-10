@@ -14,7 +14,7 @@ set.seed(1)
 config <- list(slice_min = 0.3, slice_max = 4, slice_increment = 0.2,
                slice_width = 0.1, max_dbh = 1, geometry_threads = 1L,
                non_tree_ids = 0, random_seed = 42L,
-               dbh_band_points = inventory_dbh_band_point_budget, dbh_runs = 5L, geometry_k = 10L)
+               dbh_runs = 5L, geometry_k = 10L, metrics_grid = 0)
 spec <- list(source = "SAT", instance = "PredInstance_SAT")
 terrain <- 2
 radius <- 0.2
@@ -32,14 +32,14 @@ normalized <- normalize_inventory_points(data.table::copy(points), dtm)
 crs <- sf::st_crs(32632)
 
 set.seed(7)
-plain <- measure_inventory_points(data.table::copy(normalized), spec, config, NULL, crs)
+plain <- inventory_from_points(data.table::copy(normalized), spec, config, NULL, crs)
 
 stage <- tempfile("dbh-evidence-")
 dir.create(stage)
 with_evidence <- modifyList(config, list(dbh_evidence_dir = file.path(stage, ".dbh-evidence")))
 dir.create(with_evidence$dbh_evidence_dir)
 set.seed(7)
-recorded <- measure_inventory_points(data.table::copy(normalized), spec, with_evidence, NULL, crs)
+recorded <- inventory_from_points(data.table::copy(normalized), spec, with_evidence, NULL, crs)
 stopifnot(identical(plain, recorded))
 
 evidence <- tree_evidence(with_evidence, recorded)
@@ -55,7 +55,8 @@ stopifnot(nrow(slices) == 19L, identical(slices$slice_id, 1:19),
           all(abs(slices$ground_z - terrain) < 1e-9))
 # The reported DBH is the radius spline at 1.3 m (+ half an increment), near the fitted slices.
 stopifnot(abs(recorded$dbh_m / 2 - stats::median(slices$spline_r, na.rm = TRUE)) < 0.01)
-stopifnot(grepl("^POLYGON \\(\\(", evidence$crown_hull))
-hull <- sf::st_as_sfc(evidence$crown_hull, crs = crs)
-stopifnot(abs(as.numeric(sf::st_area(hull)) - recorded$convex_hull_area_m2) < 1e-3)
+geometry <- jsonlite::fromJSON(evidence$crown_hull)
+ring <- geometry$coordinates[1L, , ]
+stopifnot(identical(geometry$type, "Polygon"), identical(ring[1L, ], ring[nrow(ring), ]),
+          abs(polygon_area(ring[, 1L], ring[, 2L]) - recorded$convex_hull_area_m2) < 1e-3)
 cat("dbh evidence: ok\n")

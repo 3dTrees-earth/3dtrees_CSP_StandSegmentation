@@ -60,7 +60,7 @@ run_case <- function(label, mode, csp = FALSE, chunk_size = 300,
             "--inventory-attributes", "PredScore_FM,PredSemantic_FM",
             "--read-chunk-size", as.character(chunk_size),
             if (!is.null(inventory_read_mode)) c("--inventory-read-mode", inventory_read_mode),
-            "--dtm-workers", "1")
+            "--dtm-workers", "1", "--debug-outputs", "true")
   if (mode == "supplied") args <- c(args, "--dtm", dtm_path)
   if (csp) args <- c(args, "--enable-csp", "true")
   status <- suppressWarnings(system2("Rscript", args, stdout = log, stderr = log))
@@ -94,20 +94,18 @@ check_case <- function(output, mode, csp = FALSE, read_mode = NULL) {
                         unname(tools::md5sum(dtm_path))))
   } else {
     stopifnot(!identical(manifest$dtm$source, "supplied"),
-              any(is.finite(terra::values(terra::rast(file.path(output, "dtm_full.tif"))))))
+              any(is.finite(terra::values(terra::rast(file.path(output, "dtm_full.tif"))))),
+              grepl("DEFLATE", paste(terra::describe(file.path(output, "dtm_full.tif")), collapse = "\n")))
   }
-  # One table in two files.
+  # One crown per tree, embedded as a GeoJSON geometry; the CRS is in the summary.
   inventory <- data.table::as.data.table(utils::read.csv(file.path(output, "inventory.csv"), na.strings = ""))
   parquet <- data.table::as.data.table(arrow::read_parquet(file.path(output, "inventory.parquet")))
-  columns <- c("instance_dimension", "instance_id", "point_count", "x", "y", "z", "longitude",
-               "latitude", "dbh_m", "dbh_fits", "dbh_slices", "crown_hull")
-  same <- function(column) {
-    if (is.character(parquet[[column]])) return(identical(inventory[[column]], parquet[[column]]))
-    isTRUE(all.equal(as.numeric(inventory[[column]]), as.numeric(parquet[[column]]), tolerance = 1e-6))
-  }
-  stopifnot(identical(names(inventory), names(parquet)), all(vapply(columns, same, logical(1))))
+  crowns <- inventory$crown_hull[!is.na(inventory$crown_hull)]
+  stopifnot(identical(names(inventory), names(parquet)), nrow(parquet) == nrow(inventory),
+            length(crowns) > 0L,
+            all(vapply(crowns, function(g) identical(jsonlite::fromJSON(g)$type, "Polygon"), logical(1))))
   summary <- utils::read.csv(file.path(output, "stand_summary.csv"))
-  stopifnot(setequal(summary$instance_dimension, segmentations),
+  stopifnot(all(summary$crs == "EPSG:32632"), setequal(summary$instance_dimension, segmentations),
             identical(summary$tree_count[match(segmentations, summary$instance_dimension)],
                       vapply(segmentations, function(d) sum(inventory$instance_dimension == d), integer(1),
                              USE.NAMES = FALSE)))
@@ -123,7 +121,6 @@ check_case <- function(output, mode, csp = FALSE, read_mode = NULL) {
       identical(as.numeric(rows$instance_id), as.numeric(as.character(expected$Var1))),
       identical(as.numeric(rows$point_count), as.numeric(expected$Freq)),
       all(is.finite(rows$longitude)), all(is.finite(rows$latitude)),
-      all(grepl("^POLYGON", rows$crown_hull)),
       all(vapply(rows$dbh_fits, function(text) is.data.frame(jsonlite::fromJSON(text)), logical(1))),
       !any(c("inventory_quality_code", "inventory_quality_label") %in% names(rows))
     )
@@ -134,9 +131,18 @@ check_case <- function(output, mode, csp = FALSE, read_mode = NULL) {
   }
   stopifnot(sum(inventory$segmentation_source == "SAT") == 2L)
   if (csp) {
+    # Each CSP tree carries its seed; the other segmentations have none.
+    seeds <- data.table::fread(file.path(output, "effective_seeds.tsv"))
+    csp_rows <- inventory[segmentation_source == "CSP"]
+    seed_row <- match(csp_rows$instance_id, seeds$TreeID)
+    stopifnot(identical(names(inventory)[match("z", names(inventory)) + 1:3], c("seed_x", "seed_y", "seed_height_m")),
+              !anyNA(seed_row), isTRUE(all.equal(csp_rows$seed_x, seeds$X[seed_row])),
+              isTRUE(all.equal(csp_rows$seed_height_m, seeds$Z[seed_row])),
+              all(is.na(inventory[segmentation_source != "CSP", seed_x])))
+    # The CSP cloud is the whole input: every point and every dimension.
     stopifnot(nrow(output_cloud@data) == nrow(cloud@data),
-              all(c(unname(dimensions), "PredInstance_CSP") %in% names(output_cloud@data)))
-    for (dimension in dimensions) {
+              setequal(names(output_cloud@data), c(names(cloud@data), "PredInstance_CSP")))
+    for (dimension in setdiff(names(cloud@data), c("X", "Y", "Z"))) {
       stopifnot(identical(output_cloud@data[[dimension]], cloud@data[[dimension]]))
     }
   } else {
@@ -160,8 +166,8 @@ check_case(sequential, "supplied", read_mode = "sequential_scan_and_instance_par
 sequential_metadata <- jsonlite::fromJSON(file.path(sequential, "run_metadata.json"))
 stopifnot(sequential_metadata$read_chunk_size_m == 10,
           sequential_metadata$spatial_bucket_count > 0)
-stopifnot(identical(unname(tools::md5sum(file.path(spatial, "inventory.parquet"))),
-                    unname(tools::md5sum(file.path(sequential, "inventory.parquet")))))
+stopifnot(identical(unname(tools::md5sum(file.path(spatial, "inventory.csv"))),
+                    unname(tools::md5sum(file.path(sequential, "inventory.csv")))))
 cat("passed supplied-laz (auto: sequential reader, same inventory as spatial)\n")
 
 output <- run_case("generated", "generated")

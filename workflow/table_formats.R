@@ -1,8 +1,8 @@
-# Output tables. The inventory is one table written twice with the same rows
-# and columns: inventory.csv for people and inventory.parquet for the 3Dtrees
-# viewer. Rows are sorted by (instance_dimension, instance_id) and Parquet row
-# groups hold at most `parquet_row_group_rows` rows, so the viewer fetches one
-# tree's row group by range using the row-group min/max statistics.
+# Output tables: inventory.csv and inventory.parquet with the same rows and
+# columns, and stand_summary.csv. Rows are sorted by
+# (instance_dimension, instance_id) and Parquet row groups hold at most
+# `parquet_row_group_rows` rows, so the viewer fetches one tree's row group by
+# range using the row-group min/max statistics.
 
 parquet_row_group_rows <- 2048L
 instance_sort_keys <- c("instance_dimension", "instance_id")

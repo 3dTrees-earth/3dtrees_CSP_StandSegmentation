@@ -30,6 +30,7 @@ jobs:
           tags: |
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
             type=ref,event=tag
+            type=semver,pattern={{version}}
             type=sha
       - uses: docker/build-push-action@v6
         id: build
@@ -46,7 +47,7 @@ jobs:
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_cli.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_outputs.R
-          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_parquet_outputs.R
+          docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_table_outputs.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_dbh_evidence.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_rlas_extra_bytes.R
           docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work "$IMAGE" Rscript tests/tool/test_end_to_end.R

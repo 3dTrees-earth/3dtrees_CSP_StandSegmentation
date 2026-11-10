@@ -69,12 +69,12 @@ stopifnot(
   all(is.finite(exports$inventories$SAT$longitude)),
   all(is.finite(exports$inventories$SAT$latitude)),
   nrow(csv) == 2L, all(c("x", "y", "z", "longitude", "latitude", "dbh_quality_code",
-                         "dbh_quality_label", "scientific_name", "diagnostics", "dbh_fits",
-                         "dbh_slices", "crown_hull") %in% names(csv))
+                         "dbh_quality_label", "scientific_name", "dbh_fits",
+                         "dbh_slices") %in% names(csv))
 )
 writeLines("{}", file.path(stage, "run_metadata.json"))
 writeLines("{}", file.path(stage, "resource_summary.json"))
-written <- write_inventory_manifest(exports, config, crs, dtm, stage)
+written <- write_inventory_manifest(exports, modifyList(config, list(debug_outputs = TRUE)), crs, dtm, stage)
 manifest <- jsonlite::fromJSON(file.path(stage, "manifest.json"), simplifyVector = FALSE)
 stopifnot(identical(manifest$schema_version, "1.0.0"),
           identical(manifest$dtm$source, "supplied"),

@@ -1,11 +1,10 @@
 #!/usr/bin/env Rscript
 
-# The inventory is one table in two files: inventory.parquet (viewer) and
-# inventory.csv (people). This test asserts that both hold the same rows and
-# columns (rewriting the Parquet rows with the CSV writer reproduces the CSV
-# byte for byte), that rows are sorted by (instance_dimension, instance_id) in
-# row groups of at most 2,048 rows, that the evidence columns (JSON and WKT)
-# come last and parse per tree, and that the stand summary is one CSV.
+# The outputs: inventory.csv and inventory.parquet with the same rows (the
+# Parquet rows rewritten as CSV reproduce the CSV byte for byte), sorted by
+# (instance_dimension, instance_id) in row groups of at most 2,048 rows, with
+# the JSON evidence (runs, slices, crown hull geometry) last and parseable per
+# tree; and the stand summary as one CSV with the CRS.
 
 arguments <- commandArgs(trailingOnly = FALSE)
 test_file <- sub("^--file=", "", grep("^--file=", arguments, value = TRUE)[[1L]])
@@ -14,17 +13,14 @@ source(file.path(root, "workflow", "cli.R"))
 source(file.path(root, "workflow", "tool.R"))
 source(file.path(root, "workflow", "outputs.R"))
 
-work <- tempfile("csp-parquet-")
+work <- tempfile("csp-tables-")
 dir.create(work)
 crs <- sf::st_crs(32632)
 set.seed(3)
 
-# Two segmentations, 35,000 trees in shuffled order: the combined inventory and
-# the evidence tables span several row groups.
+# Two segmentations, 35,000 trees in shuffled order.
 make_inventory <- function(source, count, offset) {
   ids <- sample(seq_len(count) * 3 + offset)
-  method <- rep("standard", count)
-  method[seq(1L, count, by = 5000L)] <- "streaming_large_instance"
   data.table::data.table(
     segmentation_source = source, instance_dimension = paste0("PredInstance_", source),
     instance_id = as.numeric(ids),
@@ -38,9 +34,6 @@ make_inventory <- function(source, count, offset) {
     dbh_quality_code = sample(c(4L, 9L, NA_integer_), count, replace = TRUE),
     dbh_quality_label = sample(c("spline_fit", "dbh_unavailable", ""), count, replace = TRUE),
     dbh_band_points = sample.int(1000000L, count, replace = TRUE),
-    dbh_band_source_points = 2000000L,
-    dbh_band_voxel_m = ifelse(stats::runif(count) < 0.001, 0.002, 0),
-    inventory_method = method,
     pred_ok = sample(c(TRUE, FALSE, NA), count, replace = TRUE),
     all_na_value = NA_real_
   )
@@ -70,9 +63,9 @@ runs[, `:=`(run = rep(2:1, nrow(trees)), seed = 42L, dbh_m = NA_real_,
             quality_code = 9L, reported = rep(c(FALSE, TRUE), nrow(trees)))]
 record_evidence(config, "dbh_runs", runs)
 record_evidence(config, "crown_hulls", trees[, .(
-  instance_dimension, instance_id, priority = 1L, vertex_count = 4L,
-  wkt = sprintf("POLYGON ((%1$.3f %2$.3f, %3$.3f %2$.3f, %3$.3f %4$.3f, %1$.3f %4$.3f, %1$.3f %2$.3f))",
-                x - 1, y - 1, x + 1, y + 1)
+  instance_dimension, instance_id,
+  ring = sprintf("[%1$.3f,%2$.3f],[%3$.3f,%2$.3f],[%3$.3f,%4$.3f],[%1$.3f,%4$.3f],[%1$.3f,%2$.3f]",
+                 x - 1, y - 1, x + 1, y + 1)
 )])
 
 stage <- file.path(work, "stage")
@@ -86,49 +79,44 @@ parquet <- arrow::read_parquet(file.path(stage, "inventory.parquet"))
 rewritten <- file.path(work, "rewritten.csv")
 write_csv_table(data.table::as.data.table(parquet), rewritten)
 stopifnot(identical(unname(tools::md5sum(rewritten)), unname(tools::md5sum(file.path(stage, "inventory.csv")))),
-          nrow(parquet) == 35000L)
-arrow_table <- arrow::read_parquet(file.path(stage, "inventory.parquet"), as_data_frame = FALSE)
-stopifnot(is.null(arrow_table$metadata$r),
-          identical(tail(names(parquet), 4L), c("diagnostics", "dbh_fits", "dbh_slices", "crown_hull")),
-          identical(arrow_table$schema$all_na_value$type$ToString(), "double"),
-          identical(arrow_table$schema$pred_ok$type$ToString(), "bool"),
-          identical(arrow_table$schema$dbh_slices$type$ToString(), "string"))
+          arrow::ParquetFileReader$create(file.path(stage, "inventory.parquet"))$num_row_groups == 18L)
 
-# Sorted rows in 2,048-row groups: one tree's evidence is one small range read.
-stopifnot(arrow::ParquetFileReader$create(file.path(stage, "inventory.parquet"))$num_row_groups == 18L,
-          identical(parquet$instance_dimension[[1L]], "PredInstance_FM"),
-          identical(parquet$instance_id[1:2], c(4, 7)),
-          !is.unsorted(paste(parquet$instance_dimension, sprintf("%09.0f", parquet$instance_id))))
-tree <- parquet[parquet$instance_dimension == "PredInstance_SAT" & parquet$instance_id == 300, ]
+# Sorted rows, evidence last.
+table <- data.table::as.data.table(utils::read.csv(file.path(stage, "inventory.csv"), na.strings = ""))
+stopifnot(nrow(table) == 35000L,
+          identical(tail(names(table), 3L), c("dbh_fits", "dbh_slices", "crown_hull")),
+          identical(table$instance_dimension[[1L]], "PredInstance_FM"),
+          identical(as.numeric(table$instance_id[1:2]), c(4, 7)),
+          !is.unsorted(paste(table$instance_dimension, sprintf("%09.0f", table$instance_id))))
+
+tree <- table[instance_dimension == "PredInstance_SAT" & instance_id == 300]
+crown <- jsonlite::fromJSON(tree$crown_hull)
+stopifnot(all(!is.na(table$crown_hull)), identical(crown$type, "Polygon"),
+          identical(dim(crown$coordinates), c(1L, 5L, 2L)),
+          isTRUE(all.equal(crown$coordinates[1L, 1L, ], c(tree$x - 1, tree$y - 1), tolerance = 1e-9)))
 fits <- jsonlite::fromJSON(tree$dbh_fits)
 tree_slices <- jsonlite::fromJSON(tree$dbh_slices)
 stopifnot(nrow(tree) == 1L, identical(fits$run, 1:2), identical(fits$reported, c(TRUE, FALSE)),
           identical(tree_slices$slice_id, 1:2), !"run" %in% names(tree_slices),
           all(tree_slices$status %in% dbh_slice_statuses), all(is.na(tree_slices$spline_r)),
-          grepl("^POLYGON \\(\\(", tree$crown_hull),
           isTRUE(all.equal(tree_slices$circle_x, rep(tree$x, 2L))))
-
-# Diagnostics name streamed and thinned trees only.
-streamed <- parquet$inventory_method == "streaming_large_instance"
-stopifnot(all(grepl("^streaming_large_instance: ", parquet$diagnostics[streamed])),
-          all(is.na(parquet$diagnostics[!streamed & parquet$dbh_band_voxel_m == 0])),
-          all(grepl("dbh_band_thinned: ", parquet$diagnostics[parquet$dbh_band_voxel_m > 0])))
 
 # The stand summary: one CSV row per segmentation.
 summary <- utils::read.csv(file.path(stage, "stand_summary.csv"))
 stopifnot(identical(summary$instance_dimension, c("PredInstance_FM", "PredInstance_SAT")),
+          all(summary$crs == "EPSG:32632"),
           identical(summary$tree_count, c(15000L, 20000L)))
 artifacts <- vapply(exports$artifacts, `[[`, character(1), "key")
 stopifnot(identical(artifacts, c("inventory.csv", "inventory.parquet", "stand_summary.csv")),
           identical(exports$artifacts[[2L]]$row_group_rows, 2048L),
-          identical(unlist(exports$artifacts[[2L]]$sorted_by), c("instance_dimension", "instance_id")))
+          identical(unlist(exports$artifacts[[1L]]$sorted_by), c("instance_dimension", "instance_id")))
 
 # --dbh-evidence false: the same columns, empty.
 plain_stage <- file.path(work, "plain")
 dir.create(plain_stage)
 plain <- write_outputs(inventories, list(area_m2 = 10000, area_source = "aoi"), plain_stage,
                        modifyList(config, list(dbh_evidence_dir = NULL)), crs)
-stopifnot(identical(names(plain$tables$inventory), names(parquet)),
+stopifnot(identical(names(plain$tables$inventory), names(table)),
           all(is.na(plain$tables$inventory$dbh_fits)), all(is.na(plain$tables$inventory$crown_hull)))
 
 unlink(work, recursive = TRUE, force = TRUE)

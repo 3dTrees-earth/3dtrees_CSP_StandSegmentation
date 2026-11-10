@@ -19,16 +19,15 @@ record_evidence <- function(config, table_name, rows) {
   invisible()
 }
 
-# The crown hull as one closed ring in WKT. `priority` lets the streaming summary
-# of a large instance replace the hull its stem-band remeasurement wrote.
-record_crown_hull <- function(config, instance, id, x, y, priority) {
+# The crown hull as a GeoJSON Polygon geometry (one closed ring, source CRS,
+# mm coordinates), embedded in the table like the slices.
+record_crown_hull <- function(config, instance, id, x, y) {
   if (!evidence_enabled(config) || length(x) < 3L) return(invisible())
   ring <- chull(x, y)
   ring <- c(ring, ring[[1L]])
   record_evidence(config, "crown_hulls", data.table::data.table(
-    instance_dimension = instance, instance_id = as.numeric(id), priority = priority,
-    vertex_count = length(ring) - 1L,
-    wkt = sprintf("POLYGON ((%s))", paste(sprintf("%.3f %.3f", x[ring], y[ring]), collapse = ", "))
+    instance_dimension = instance, instance_id = as.numeric(id),
+    ring = paste(sprintf("[%.3f,%.3f]", x[ring], y[ring]), collapse = ",")
   ))
 }
 
@@ -50,14 +49,14 @@ record_tree_evidence <- function(config, instance, id, seed, fits, slices, chose
   }
   # Upstream measures the crown above 0.5 m; the workflow falls back to all points.
   crown <- is.finite(points$Z) & points$Z > 0.5
-  if (sum(crown) >= 3L) record_crown_hull(config, instance, id, points$X[crown], points$Y[crown], 1L)
-  else record_crown_hull(config, instance, id, points$X, points$Y, 1L)
+  if (sum(crown) >= 3L) record_crown_hull(config, instance, id, points$X[crown], points$Y[crown])
+  else record_crown_hull(config, instance, id, points$X, points$Y)
 }
 
 # Column types are fixed so a column that happens to be all-NA in one run (no
 # spline, no fitted run) still writes numbers, not strings, into the JSON.
 dbh_evidence_column_classes <- list(
-  character = c("instance_dimension", "status", "wkt"),
+  character = c("instance_dimension", "status", "ring"),
   numeric = c("instance_id", "z_lo_m", "z_hi_m", "ground_z", "circle_x", "circle_y", "radius_m",
               "spline_x", "spline_y", "spline_r", "dbh_m"),
   integer = c("run", "slice_id", "n_points", "n_fit_points", "seed", "quality_code", "priority",
@@ -102,9 +101,7 @@ json_per_tree <- function(rows, order, column) {
 }
 
 # The evidence of every inventoried tree as inventory columns: `dbh_fits` and
-# `dbh_slices` (JSON arrays) and `crown_hull` (WKT). A tree measured twice
-# (large-instance remeasurement) keeps its last rows; the streaming hull of a
-# large instance wins over its stem-band hull.
+# `dbh_slices` (JSON arrays) and `crown_hull` (a GeoJSON Polygon geometry).
 tree_evidence <- function(config, keys) {
   if (!evidence_enabled(config)) return(NULL)
   keys <- unique(keys[, .(instance_dimension, instance_id = as.numeric(instance_id))])
@@ -124,10 +121,9 @@ tree_evidence <- function(config, keys) {
   }
   hulls <- read_evidence(config$dbh_evidence_dir, "crown_hulls")
   if (!is.null(hulls)) {
-    hulls <- hulls[keys, on = instance_sort_keys, nomatch = NULL]
-    data.table::setorderv(hulls, c(instance_sort_keys, "priority"), c(1L, 1L, -1L))
-    hulls <- unique(hulls, by = instance_sort_keys)
-    evidence <- merge(evidence, hulls[, .(instance_dimension, instance_id, crown_hull = wkt)], all.x = TRUE)
+    hulls <- unique(hulls[keys, on = instance_sort_keys, nomatch = NULL], by = instance_sort_keys, fromLast = TRUE)
+    hulls[, crown_hull := sprintf('{"type":"Polygon","coordinates":[[%s]]}', ring)]
+    evidence <- merge(evidence, hulls[, .(instance_dimension, instance_id, crown_hull)], all.x = TRUE)
   }
   unlink(config$dbh_evidence_dir, recursive = TRUE)
   evidence

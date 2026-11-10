@@ -54,7 +54,7 @@ attach_species_metadata <- function(inventory, lookup) {
 
 output_field_units <- function(fields) {
   units <- stats::setNames(rep("unitless", length(fields)), fields)
-  units[intersect(fields, c("x", "y", "z", "dbh_m", "height_m", "dbh_spread_m", "dbh_band_voxel_m",
+  units[intersect(fields, c("x", "y", "z", "dbh_m", "height_m", "dbh_spread_m",
                             "mean_dbh_m", "median_dbh_m",
                             "dbh_p05_m", "dbh_p25_m", "dbh_p75_m", "dbh_p95_m", "mean_height_m",
                             "median_height_m", "height_p05_m", "height_p25_m", "height_p75_m",
@@ -66,29 +66,13 @@ output_field_units <- function(fields) {
   as.list(units)
 }
 
-# One line per tree on what to know before using its values.
-tree_diagnostics <- function(inventory) {
-  method <- if ("inventory_method" %in% names(inventory)) inventory$inventory_method else rep(NA_character_, nrow(inventory))
-  large <- !is.na(method) & method == "streaming_large_instance"
-  voxel <- if ("dbh_band_voxel_m" %in% names(inventory)) inventory$dbh_band_voxel_m else rep(NA_real_, nrow(inventory))
-  thinned <- is.finite(voxel) & voxel > 0
-  notes <- cbind(
-    ifelse(large, sprintf(
-      "streaming_large_instance: %.0f points; species probability and FM score use a deterministic sample of at most %d points%s",
-      inventory$point_count, inventory_large_instance_sample_limit,
-      ifelse(is.na(inventory$dbh_m), "; x/y from that sample because no DBH could be fitted", "")), NA),
-    ifelse(thinned, sprintf(
-      "dbh_band_thinned: stem band kept %.0f of %.0f points, one per %.0f mm voxel",
-      inventory$dbh_band_points, inventory$dbh_band_source_points, voxel * 1000), NA))
-  apply(notes, 1L, function(row) if (all(is.na(row))) NA_character_ else paste(row[!is.na(row)], collapse = " | "))
-}
-
 evidence_columns <- c("dbh_fits", "dbh_slices", "crown_hull")
 
 # inventory.csv and inventory.parquet hold the same table: one row per tree and
-# segmentation, measurements first, then `diagnostics` and the evidence columns
-# (JSON arrays and WKT) that the viewer reads only for an opened tree.
-# stand_summary.csv holds one row per segmentation.
+# segmentation, measurements first, then the DBH evidence as
+# JSON (slices, runs and the crown hull as a GeoJSON geometry), which the viewer
+# reads only for an opened tree. stand_summary.csv holds one row per
+# segmentation and the CRS of every coordinate.
 write_outputs <- function(inventories, area, stage_dir, config, crs) {
   validate_inventory_crs(crs)
   lookup <- read_species_lookup(config$species_lookup)
@@ -97,16 +81,18 @@ write_outputs <- function(inventories, area, stage_dir, config, crs) {
   })
   inventory <- data.table::rbindlist(inventories, use.names = TRUE, fill = TRUE)
   inventory[, instance_id := as.numeric(instance_id)]
-  inventory[, diagnostics := tree_diagnostics(inventory)]
   evidence <- tree_evidence(config, inventory)
   if (!is.null(evidence)) inventory <- merge(inventory, evidence, by = instance_sort_keys, all.x = TRUE, sort = FALSE)
   for (column in setdiff(evidence_columns, names(inventory))) data.table::set(inventory, j = column, value = NA_character_)
   leading <- c("segmentation_source", instance_sort_keys)
-  data.table::setcolorder(inventory, c(leading, setdiff(names(inventory), c(leading, "diagnostics", evidence_columns)),
-                                       "diagnostics", evidence_columns))
+  data.table::setcolorder(inventory, c(leading, setdiff(names(inventory), c(leading, evidence_columns)),
+                                       evidence_columns))
+  seeded <- intersect(c("seed_x", "seed_y", "seed_height_m"), names(inventory))
+  if (length(seeded)) data.table::setcolorder(inventory, seeded, after = "z")
   sorted_by <- sort_by_instance(inventory)
   summary <- data.table::rbindlist(lapply(inventories, stand_summary_for_inventory, area = area), fill = TRUE)
   sort_by_instance(summary)
+  summary[, crs := if (is.na(crs$epsg)) crs$wkt else sprintf("EPSG:%d", crs$epsg)]
   write_csv_table(inventory, file.path(stage_dir, "inventory.csv"))
   write_parquet_table(inventory, file.path(stage_dir, "inventory.parquet"))
   write_csv_table(summary, file.path(stage_dir, "stand_summary.csv"))
@@ -118,6 +104,13 @@ write_outputs <- function(inventories, area, stage_dir, config, crs) {
   )
   list(inventories = inventories, tables = list(inventory = inventory, stand_summary = summary),
        artifacts = artifacts)
+}
+
+# Run records (settings, timings, audits) only with --debug-outputs true.
+write_debug_json <- function(config, value, path) {
+  if (isTRUE(config$debug_outputs)) {
+    jsonlite::write_json(value, path, auto_unbox = TRUE, pretty = TRUE, na = "null")
+  }
 }
 
 manifest_scalar <- function(value) {
@@ -217,16 +210,16 @@ write_inventory_manifest <- function(exports, config, crs, dtm, stage_dir) {
     dtm = list(key = "dtm_full.tif", source = dtm$method,
                crs_wkt = terra::crs(raster), resolution_m = as.numeric(terra::res(raster)),
                aoi_key = if (file.exists(file.path(stage_dir, "dtm_aoi.tif"))) "dtm_aoi.tif" else NULL),
-    artifacts = c(exports$artifacts, list(
-      list(key = "dtm_full.tif", format = "geotiff"),
-      list(key = "run_metadata.json", format = "json"),
-      list(key = "resource_summary.json", format = "json")
-    ), lapply(intersect(c("dtm_aoi.tif", "effective_seeds.tsv", "segmented_csp.laz", "instance_index.json"),
-                        list.files(stage_dir)), function(key) list(key = key, format = tools::file_ext(key))))
+    artifacts = c(exports$artifacts, list(list(key = "dtm_full.tif", format = "geotiff")),
+                  lapply(intersect(c("dtm_aoi.tif", "effective_seeds.tsv", "segmented_csp.laz", "instance_index.json",
+                                     "run_metadata.json", "resource_summary.json"), list.files(stage_dir)),
+                         function(key) list(key = key, format = tools::file_ext(key))))
   )
   expected_dimensions <- vapply(exports$inventories, function(inventory) unique(inventory$instance_dimension), character(1))
   validate_inventory_manifest(manifest, stage_dir, expected_dimensions)
-  jsonlite::write_json(manifest, file.path(stage_dir, "manifest.json"), auto_unbox = TRUE,
-                       pretty = TRUE, na = "null", null = "null")
+  if (isTRUE(config$debug_outputs)) {
+    jsonlite::write_json(manifest, file.path(stage_dir, "manifest.json"), auto_unbox = TRUE,
+                         pretty = TRUE, na = "null", null = "null")
+  }
   invisible(manifest)
 }

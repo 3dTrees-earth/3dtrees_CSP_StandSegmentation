@@ -68,7 +68,7 @@ dtm_config <- parse_cli_args(c(
   "--instance-attribute", "PredInstance_SAT", "--dtm", "terrain.tif"
 ))
 stopifnot(identical(dtm_config$dtm, "terrain.tif"))
-# One inventory table in CSV and Parquet: there is no format choice any more.
+# The result files are fixed: there is no format choice any more.
 expect_error(parse_cli_args(c("--input", "input.laz", "--output-dir", "output",
                               "--instance-attribute", "PredInstance_SAT", "--output-formats", "csv")),
              "Unknown option")
@@ -164,22 +164,16 @@ points <- data.table::data.table(
   PredScore_FM = c(0.9, 0.9, 0.2, -1),
   PredSemantic_FM = c(1, 2, 2, 0)
 )
-species <- species_by_instance(points, spec)
-tree_one <- species[PredInstance_FM == 1]
+points[, `:=`(X = 0, Y = 0, Z = 0)]
+collect <- function(id) add_tree_points(new_tree(), points[PredInstance_FM == id], spec, list(metrics_grid = 0))
+species <- species_vote(collect(1))
+stopifnot(species[[1L]] == 4, species[[2L]] == 0.7, abs(species[[3L]] - 1 / 3) < 1e-12)
+fm <- fm_fields(collect(1))
 stopifnot(
-  tree_one$species_id == 4,
-  tree_one$species_prob == 0.7,
-  abs(tree_one$species_conflict_fraction - 1 / 3) < 1e-12
-)
-fm <- fm_by_instance(points, "PredInstance_FM")
-fm_one <- fm[PredInstance_FM == 1]
-stopifnot(
-  identical(fm_one$pred_score_fm_values, '[{"score":0.9,"point_count":2},{"score":0.2,"point_count":1}]'),
-  is.na(fm[PredInstance_FM == 2]$pred_score_fm_values),
-  fm_one$wood_point_count == 1,
-  fm_one$leaf_point_count == 2,
-  abs(fm_one$wood_share - 1 / 3) < 1e-12,
-  abs(fm_one$leaf_share - 2 / 3) < 1e-12
+  identical(fm[[1L]], '[{"score":0.9,"point_count":2},{"score":0.2,"point_count":1}]'),
+  is.na(fm_fields(collect(2))[[1L]]),
+  fm[[2L]] == 1, fm[[3L]] == 2,
+  abs(fm[[4L]] - 1 / 3) < 1e-12, abs(fm[[5L]] - 2 / 3) < 1e-12
 )
 
 header <- lidR::readLASheader(file.path(root, "tests", "tool", "fixtures", "multi-instance.copc.laz"))

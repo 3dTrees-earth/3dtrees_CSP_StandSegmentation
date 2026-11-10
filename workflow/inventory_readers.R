@@ -14,13 +14,13 @@ reader_input_metadata <- function(stream) {
        input_read_selectors = unname(stream$selectors),
        input_source_point_reads = stream$source_point_reads,
        input_dimensions_dropped = stream$dropped_dimensions,
-       input_decompressed_groups = stream$decompressed_groups,
-       largest_instances = stream$largest_instances, oversized_instances = stream$oversized_instances)
+       input_decompressed_groups = stream$decompressed_groups)
 }
 
 prepare_owned_reader <- function(files, bounds, config, work_dir, stage_dir) {
   stream <- index_owned_inventory(files, config$segmentation_specs, config, work_dir)
-  if (!file.copy(stream$owned_index_path, file.path(stage_dir, "instance_index.json"))) {
+  if (isTRUE(config$debug_outputs) &&
+      !file.copy(stream$owned_index_path, file.path(stage_dir, "instance_index.json"))) {
     abort("Could not preserve the complete-instance index")
   }
   metadata <- c(reader_input_metadata(stream), list(
@@ -34,7 +34,7 @@ prepare_owned_reader <- function(files, bounds, config, work_dir, stage_dir) {
     audits <- attr(inventories, "copc_audits")
     owned <- list(
       core_size_m = config$inventory_core_size, initial_buffer_m = config$inventory_buffer,
-      batch_point_limit = config$inventory_batch_points, retained_point_budget = config$inventory_retained_points,
+      batch_point_limit = config$inventory_batch_points,
       shared_decode_threads = config$inventory_decode_threads,
       index_elapsed_seconds = stream$owned_index$elapsed_seconds,
       index_audit = stream$owned_index$audit, windows = audits,

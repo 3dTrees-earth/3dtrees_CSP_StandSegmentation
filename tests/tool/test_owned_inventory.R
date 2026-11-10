@@ -25,7 +25,7 @@ read_inventory <- function(path, slug, evidence = TRUE) {
   if (!evidence) rows[, c("dbh_fits", "dbh_slices", "crown_hull") := NULL]
   rows
 }
-config <- parse_cli_args(c("--input", input, "--output-dir", file.path(work, "owned"),
+config <- parse_cli_args(c("--input", input, "--output-dir", file.path(work, "owned"), "--debug-outputs", "true",
                           "--instance-attribute", "PredInstance_FM", "--species-attribute", "species_id_FM", "--species-probability-attribute", "species_prob_FM",
                           "--instance-attribute", "PredInstance_SAT", "--species-attribute", "species_id_FM", "--species-probability-attribute", "species_prob_FM",
                           "--instance-attribute", "PredInstance_ULS", "--dtm", dtm_path,
@@ -136,27 +136,22 @@ stopifnot(instance_inventory_seed(42, "PredInstance_FM", "2") == 2091750084L,
           instance_inventory_seed(42, "PredInstance_FM", "2") != instance_inventory_seed(42, "PredInstance_SAT", "2"),
           instance_inventory_seed(42, "PredInstance_FM", "2") != instance_inventory_seed(43, "PredInstance_FM", "2"))
 
-# Same full-point count contract for the bounded large-instance path. Lower
-# the threshold for this fixture; no synthetic giant cloud or disk spool.
+# Other cores and worker counts give the same rows: every tree is collected
+# the same way and seeded from its identity.
 config$inventory_workers <- 3L
 config$inventory_core_size <- 100
 config$inventory_buffer <- 20
 # Called without run_tool, so resolve the auto defaults (index workers) here.
 config <- resolve_inventory_read_mode(config, input)
 stream <- index_owned_inventory(input, config$segmentation_specs, config, work)
-inventory_instance_point_limit <- 100L
 result <- inventory_from_owned_windows(stream, terra::rast(dtm_path), config, NULL, sf::st_crs(cloud))
 for (slug in names(result)) {
   baseline <- read_inventory(config$output_dir, slug)
   rows <- result[[slug]]
-  stopifnot(identical(as.numeric(rows$point_count), as.numeric(baseline$point_count)),
-            all(rows$inventory_method == "streaming_large_instance"), all(is.na(rows$dbh_m)))
-  spec <- stream$layouts[[slug]]$spec
-  for (id in rows$instance_id) {
-    points <- cloud@data[get(spec$instance) == id]
-    row <- rows[instance_id == id]
-    stopifnot(row$x == median(points$X), row$y == median(points$Y),
-              abs(row$height_m - diff(range(points$Z))) < 1e-8)
+  stopifnot(identical(as.numeric(rows$point_count), as.numeric(baseline$point_count)))
+  for (column in c("x", "y", "z", "dbh_m", "height_m", "convex_hull_area_m2", "metrics_point_count",
+                   "dbh_quality_code", "dbh_band_points")) {
+    stopifnot(isTRUE(all.equal(as.numeric(rows[[column]]), as.numeric(baseline[[column]]), tolerance = 1e-9)))
   }
 }
 

@@ -1,7 +1,11 @@
-# Unreleased (3Dtrees fork)
+# CspStandSegmentation 1.0.0 (3Dtrees fork)
 
 ## Breaking changes
 
+-   Inventory: every tree is collected the same way and measured once complete. DBH, height, crown and position use one point per tree and `--metrics-grid` cell (default 0.01 m); `point_count`, species, probability and FM fields count every input point; new column `metrics_point_count`. The separate summary for trees above two million points, `inventory_method`, `diagnostics`, `--inventory-retained-points` and the COPC window retention budget are gone (one window per core). `workflow/resource_request.py` and the partition audit helper are removed.
+-   Outputs: `inventory.csv` and `inventory.parquet` (same table) and `stand_summary.csv`, plus the DTM. The crown hull is a GeoJSON Polygon geometry in the `crown_hull` column, next to `dbh_fits` and `dbh_slices`; `stand_summary.csv` names the CRS in a `crs` column. `manifest.json`, `run_metadata.json`, `resource_summary.json` and `instance_index.json` are written only with `--debug-outputs true`.
+-   CSP: each CSP tree row carries the seed it grew from in `seed_x`, `seed_y` and `seed_height_m` (height above the terrain), right after `z`; other segmentations have no seed columns. `effective_seeds.tsv` is written only with `--debug-outputs true`.
+-   Inventory: no point limits or memory guards. Every stem-band point is measured; `--dbh-band-points`, `dbh_band_source_points` and `dbh_band_voxel_m` are gone. Streamed large trees use exact medians instead of a 100,000-point sample. Size checks on instance ids, COPC nodes and hierarchy, window retention and RAM no longer abort a run.
 -   Inventory: `pred_score_fm` and `pred_score_mixed` are replaced by `pred_score_fm_values`, every distinct `PredScore_FM` of the tree with its point count (JSON), so an instance merged from several FM instances shows all their scores. Large streamed trees are counted over all points, not a sample.
 -   CLI: `--segmentation-spec INSTANCE[,SPECIES,SPECIES_PROB]` is replaced by three options: `--instance-attribute` (repeat per segmentation), and `--species-attribute` and `--species-probability-attribute`, which belong to the `--instance-attribute` before them.
 -   CLI (`exec/run.R`): one inventory table in two files, `inventory.csv` and `inventory.parquet` (same rows and columns, sorted by `(instance_dimension, instance_id)`, Parquet in 2,048-row groups, snappy), plus `stand_summary.csv` with one row per segmentation. Each tree row carries its DBH evidence: `dbh_fits` and `dbh_slices` as JSON arrays and `crown_hull` as WKT, after a `diagnostics` column. The per-segmentation files, the `species`, `validation` and `issues` tables, the `dbh/` folder, `inventory.gpkg` and the `--output-formats` option (TSV/JSON/GeoPackage copies) are gone; species composition and validation counts follow from the inventory and the stand summary.
@@ -11,6 +15,9 @@
 
 ## Bug fixes
 
+-   CSP: `segmented_csp.laz` keeps every dimension of the input; it held only the dimensions the run read (instance, species and requested attributes).
+-   CSP: points are normalized like in the inventory readers: the same DTM cell lookup and the written Float32 DTM. lidR assigned points lying exactly on a DTM cell edge to the neighbouring cell, and the in-memory DTM kept double precision, so with CSP on, the same FM or SAT tree could get a slightly different stem band and position.
+-   DTM: `dtm_full.tif` and `dtm_aoi.tif` are written with DEFLATE instead of LZW, so readers without LZW support (such as Galaxy's image assertions) can open them.
 -   CLI: a generated DTM no longer fails with `[crop] extents do not overlap` when a tile's only points lie in its buffer (seen on a 668 M-point LAZ); such a tile is skipped like an empty one.
 -   Container: the pinned lidR no longer fails with "Internal error in spatial index: point out of range" when a tree's extreme coordinate lies on a 0.1 m multiple that floating point rounds up (4021833.4 m: `floor(x / 0.1) * 0.1` is 4021833.4000000004). The grid bounds now always contain the points (`patches/lidR-grid-bounds.patch`). It stopped the inventory of a 668 M-point cloud after 70 min.
 -   Container: the pinned rlas prints its read progress bar only to a terminal. A filtered (tiled) read reported NaN progress, printed as `-2147483648%`, and the bar grew job logs by megabytes (`patches/rlas-quiet-progress.patch`).

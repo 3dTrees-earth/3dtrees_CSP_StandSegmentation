@@ -1,8 +1,7 @@
 #!/usr/bin/env Rscript
 
-# Every tree gets a DBH from its stem band: small trees as before, trees
-# whose band exceeds the budget from a voxel-thinned band, and streamed
-# large trees from the band retained during streaming.
+# Every tree gets a DBH from all its stem-band points: small trees as before
+# and streamed large trees from the band retained during streaming.
 
 arguments <- commandArgs(trailingOnly = FALSE)
 test_file <- sub("^--file=", "", grep("^--file=", arguments, value = TRUE)[[1L]])
@@ -14,7 +13,7 @@ set.seed(1)
 config <- list(slice_min = 0.3, slice_max = 4, slice_increment = 0.2,
                slice_width = 0.1, max_dbh = 1, geometry_threads = 1L,
                non_tree_ids = 0, random_seed = 42L,
-               dbh_band_points = inventory_dbh_band_point_budget, dbh_runs = 5L, geometry_k = 10L)
+               dbh_runs = 5L, geometry_k = 10L, metrics_grid = 0)
 spec <- list(source = "SAT", instance = "PredInstance_SAT")
 terrain <- 2
 radius <- 0.2
@@ -38,66 +37,65 @@ terra::values(dtm) <- terrain
 normalized <- normalize_inventory_points(data.table::copy(points), dtm)
 band_total <- sum(in_dbh_band(normalized, config))
 
-# The thinning keeps original points, starts at 1 mm and doubles until it fits.
-unthinned <- dbh_band_keep(normalized[in_dbh_band(normalized, config)], band_total)
-stopifnot(all(unthinned$keep), unthinned$voxel == 0)
-thinned <- dbh_band_keep(normalized[in_dbh_band(normalized, config)], 20000)
-stopifnot(sum(thinned$keep) <= 20000, thinned$voxel >= inventory_dbh_band_initial_voxel_m,
-          isTRUE(all.equal(log2(thinned$voxel / inventory_dbh_band_initial_voxel_m) %% 1, 0)))
-again <- dbh_band_keep(normalized[in_dbh_band(normalized, config)], 20000)
-stopifnot(identical(thinned, again))
-
 dbh_close <- function(value) is.finite(value) && abs(value - 2 * radius) < 0.02
 
-# 1. Standard path: band within budget, unchanged measurement.
-set.seed(instance_inventory_seed(42L, spec$instance, "1"))
-full <- measure_inventory_points(data.table::copy(normalized), spec, config, NULL, sf::st_crs(32632))
-stopifnot(nrow(full) == 1L, dbh_close(full$dbh_m), full$dbh_band_voxel_m == 0,
-          full$dbh_band_points == band_total, full$point_count == nrow(points))
+crs <- sf::st_crs(32632)
+measure <- function(points, config) inventory_from_points(points, spec, config, NULL, crs)
 
-stopifnot(full$dbh_runs == 5L, full$dbh_runs_fitted >= 3L, is.finite(full$dbh_spread_m))
+# 1. One batch.
+full <- measure(data.table::copy(normalized), config)
+stopifnot(nrow(full) == 1L, dbh_close(full$dbh_m),
+          full$dbh_band_points == band_total, full$point_count == nrow(points),
+          full$dbh_runs == 5L, full$dbh_runs_fitted >= 3L, is.finite(full$dbh_spread_m))
 
 # Same tree in another point order (another file writer, worker or window)
 # gives the identical measurement: points are sorted, seeds follow the tree.
 set.seed(123)
-shuffled <- measure_inventory_points(data.table::copy(normalized)[sample(.N)], spec, config, NULL, sf::st_crs(32632))
+shuffled <- measure(data.table::copy(normalized)[sample(.N)], config)
 stopifnot(identical(shuffled$dbh_m, full$dbh_m), identical(shuffled$x, full$x),
           identical(shuffled$y, full$y), identical(shuffled$dbh_quality_code, full$dbh_quality_code))
 
-# 2. Band above the budget: thinned band, exact point count, same DBH.
-small_budget <- modifyList(config, list(dbh_band_points = 20000))
-set.seed(instance_inventory_seed(42L, spec$instance, "1"))
-reduced <- measure_inventory_points(data.table::copy(normalized), spec, small_budget, NULL, sf::st_crs(32632))
-stopifnot(nrow(reduced) == 1L, dbh_close(reduced$dbh_m), reduced$dbh_band_voxel_m > 0,
-          reduced$dbh_band_points <= 20000, reduced$dbh_band_source_points == band_total,
-          reduced$point_count == nrow(points),
-          abs(reduced$dbh_m - full$dbh_m) < 0.01,
-          abs(reduced$height_m - full$height_m) < 0.002)
-
-# 3. Streamed large tree: band retained across batches, DBH measured.
-state <- new_large_instance_summary(nrow(normalized))
-for (start in seq.int(1L, nrow(normalized), by = 50000L)) {
-  end <- min(start + 49999L, nrow(normalized))
-  state <- update_large_instance_summary(state, normalized[start:end], spec, small_budget)
+# 2. Many batches give exactly the same row as one.
+stream <- function(points, config) {
+  tree <- new_tree()
+  for (start in seq.int(1L, nrow(points), by = 50000L)) {
+    tree <- add_tree_points(tree, points[start:min(start + 49999L, nrow(points))], spec, config)
+  }
+  finish_tree(tree, 1, spec, config, NULL, crs)
 }
-stopifnot(nrow(state$band) <= 20000, state$band_source_points == band_total)
-# Incremental thinning across batches equals thinning the whole band at once.
-whole <- normalized[in_dbh_band(normalized, config), .(X, Y, Z, Zref)]
-once <- dbh_band_keep(whole, 20000)
-stopifnot(state$band_voxel == once$voxel, isTRUE(all.equal(state$band, whole[once$keep], check.attributes = FALSE)))
-set.seed(instance_inventory_seed(42L, spec$instance, "1"))
-large <- finish_large_instance_summary(state, "1", spec, NULL, sf::st_crs(32632), small_budget)
-stopifnot(dbh_close(large$dbh_m), large$dbh_quality_code %in% c(2L, 4L),
-          large$point_count == nrow(points), large$inventory_method == "streaming_large_instance",
-          abs(large$x - 10) < 0.05, abs(large$y - 10) < 0.05,
-          abs(large$height_m - full$height_m) < 0.002,  # LAS objects quantize to 1 mm
-          large$dbh_band_source_points == band_total, large$dbh_band_voxel_m > 0,
-          large$dbh_runs == 5L, large$dbh_runs_fitted >= 3L)
+same_tree <- function(a, b) {
+  columns <- c("x", "y", "z", "dbh_m", "height_m", "convex_hull_area_m2", "point_count",
+               "metrics_point_count", "dbh_quality_code", "dbh_runs_fitted", "dbh_band_points")
+  isTRUE(all.equal(as.list(a[, ..columns]), as.list(b[, ..columns]), check.attributes = FALSE))
+}
+stopifnot(same_tree(stream(normalized, config), full))
+
+# 3. --metrics-grid 0.01: geometry on one point per 1 cm cell, the count on
+# every point; the same result in any point order and in batches.
+grid_config <- modifyList(config, list(metrics_grid = 0.01))
+grid_full <- measure(data.table::copy(normalized), grid_config)
+cells <- nrow(unique(grid_keys(normalized, 0.01)))
+stopifnot(dbh_close(grid_full$dbh_m), grid_full$point_count == nrow(points),
+          grid_full$metrics_point_count == cells, cells < nrow(points))
+set.seed(7)
+stopifnot(same_tree(measure(data.table::copy(normalized)[sample(.N)], grid_config), grid_full),
+          same_tree(stream(normalized, grid_config), grid_full))
+
+# Exact medians from value counts: even and odd counts, across batches, and
+# species probabilities per species with missing species ignored.
+counts <- add_value_counts(add_value_counts(NULL, c(1, 2, 2)), c(NaN, 4))
+stopifnot(median_of_counts(counts) == 2, median_of_counts(add_value_counts(counts, 5)) == 2,
+          median_of_counts(add_value_counts(counts, 7)) == stats::median(c(1, 2, 2, 4, 7)),
+          is.na(median_of_counts(NULL)))
+species_spec <- list(source = "SAT", instance = "PredInstance_SAT", species = "sp", species_prob = "prob")
+labelled <- data.table::copy(normalized)[1:1000]
+labelled[, `:=`(sp = rep(c(14, NA, 3, 14), 250L), prob = rep(c(0.2, 0.9, 0.5, 0.4), 250L))]
+voted <- inventory_from_points(labelled, species_spec, config, NULL, crs)
+stopifnot(voted$species_id == 14, abs(voted$species_prob - 0.3) < 1e-12,
+          abs(voted$species_conflict_fraction - 1 / 3) < 1e-12)
 
 # 4. A tree with no stem points in the band keeps an explicit unavailable DBH.
-crown_only <- normalized[Z > 6]
-state <- update_large_instance_summary(new_large_instance_summary(nrow(crown_only)), crown_only, spec, config)
-empty <- finish_large_instance_summary(state, "1", spec, NULL, sf::st_crs(32632), config)
+empty <- measure(normalized[Z > 6], config)
 stopifnot(is.na(empty$dbh_m), empty$dbh_quality_label == "dbh_unavailable", empty$dbh_band_points == 0)
 
 cat("stem-band DBH tests passed\n")

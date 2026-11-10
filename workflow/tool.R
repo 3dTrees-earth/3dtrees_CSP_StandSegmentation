@@ -1,5 +1,5 @@
 .csp_workflow_dir <- dirname(normalizePath(sys.frame(1)$ofile, mustWork = TRUE))
-for (.csp_module in c("inventory_policy.R", "table_formats.R", "dbh_evidence.R", "instance_inventory.R", "partition_inventory.R", "owned_inventory.R",
+for (.csp_module in c("table_formats.R", "dbh_evidence.R", "instance_inventory.R", "partition_inventory.R", "owned_inventory.R",
                       "inventory_readers.R", "inventory_run.R")) {
   source(file.path(.csp_workflow_dir, .csp_module), local = TRUE)
 }
@@ -199,11 +199,22 @@ read_aoi <- function(path, las_crs) {
   union
 }
 
+# Convex hull vertices of everything seen so far; readers build the stand
+# outline batch by batch from it.
+update_streaming_hull <- function(hull, x, y) {
+  candidate <- data.table::data.table(x = x, y = y)
+  if (nrow(candidate) > 3L) candidate <- candidate[chull(x, y)]
+  if (!is.null(hull)) candidate <- data.table::rbindlist(list(hull, candidate))
+  if (nrow(candidate) > 3L) candidate <- candidate[chull(x, y)]
+  candidate
+}
+
 polygon_area <- function(x, y) {
   if (length(x) < 3L) return(NA_real_)
   indices <- chull(x, y)
-  xx <- x[indices]
-  yy <- y[indices]
+  # Shifted to the first vertex: projected coordinates cancel in the shoelace sum.
+  xx <- x[indices] - x[indices[1L]]
+  yy <- y[indices] - y[indices[1L]]
   0.5 * abs(sum(xx * c(yy[-1L], yy[1L]) - yy * c(xx[-1L], xx[1L])))
 }
 
@@ -288,6 +299,13 @@ read_supplied_seeds <- function(path) {
   seeds
 }
 
+# Each CSP tree carries the seed it grew from: TreeID is its instance ID, and
+# seed Z is a height above the terrain like the routed cloud.
+add_seed_columns <- function(inventory, seeds) {
+  row <- match(as.numeric(inventory$instance_id), seeds$TreeID)
+  inventory[, `:=`(seed_x = seeds$X[row], seed_y = seeds$Y[row], seed_height_m = seeds$Z[row])]
+}
+
 run_csp <- function(las, config, stage_dir) {
   seeds <- if (config$seed_mode == "supplied") {
     read_supplied_seeds(config$seed_file)
@@ -303,7 +321,9 @@ run_csp <- function(las, config, stage_dir) {
   }
   if (!nrow(seeds)) abort("CSP seed detection produced no seeds")
   if (nrow(seeds) < 2L) abort("CSP requires at least two effective seeds with upstream version 0.2.0")
-  data.table::fwrite(seeds, file.path(stage_dir, "effective_seeds.tsv"), sep = "\t", na = "")
+  if (isTRUE(config$debug_outputs)) {
+    data.table::fwrite(seeds, file.path(stage_dir, "effective_seeds.tsv"), sep = "\t", na = "")
+  }
 
   weighted <- any(c(config$verticality_weight, config$linearity_weight, config$sphericity_weight) > 0)
   working <- las
@@ -339,9 +359,19 @@ run_csp <- function(las, config, stage_dir) {
   )
 }
 
-write_csp_cloud <- function(original_las, csp_ids, path) {
-  if ("PredInstance_CSP" %in% names(original_las@data)) abort("Input already contains PredInstance_CSP")
-  output <- lidR::add_lasattribute(original_las, csp_ids, "PredInstance_CSP", "CSP tree instance ID")
+# DEFLATE without predictor: lossless and readable by every TIFF reader.
+write_geotiff <- function(raster, path) {
+  terra::writeRaster(raster, path, overwrite = TRUE, gdal = "COMPRESS=DEFLATE")
+}
+
+# The CSP cloud is the whole input, every dimension kept, plus PredInstance_CSP.
+write_csp_cloud <- function(files, crs, csp_ids, path) {
+  clouds <- lapply(files, function(file) suppressWarnings(lidR::readLAS(file)))
+  output <- if (length(clouds) == 1L) clouds[[1L]] else CspStandSegmentation::las_merge(clouds, fill = TRUE)
+  if ("PredInstance_CSP" %in% names(output@data)) abort("Input already contains PredInstance_CSP")
+  if (nrow(output@data) != length(csp_ids)) abort("CSP IDs do not match the input points")
+  if (is.na(sf::st_crs(output))) sf::st_crs(output) <- crs
+  output <- lidR::add_lasattribute(output, csp_ids, "PredInstance_CSP", "CSP tree instance ID")
   lidR::writeLAS(output, path)
   invisible(path)
 }
@@ -523,7 +553,7 @@ chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir, 
   )
   dtm <- terra::extend(dtm, target)
   output <- file.path(stage_dir, "dtm_full.tif")
-  terra::writeRaster(dtm, output, overwrite = TRUE)
+  write_geotiff(dtm, output)
   list(
     dtm = terra::rast(output),
     method = if (all(methods == "classification_2")) "chunked_classification_2" else "chunked_csf",
@@ -645,7 +675,6 @@ run_tool <- function(config) {
   input_dimensions <- names(original_las@data)
   input_read_selectors <- attr(original_las, "read_selectors")
   input_dimensions_dropped <- attr(original_las, "dropped_dimensions")
-  original_data <- if (config$enable_csp) data.table::copy(original_las@data) else NULL
   validate_specs(original_las, config$segmentation_specs)
   las_crs <- source_crs
   aoi <- read_aoi(config$aoi_json, las_crs)
@@ -653,7 +682,9 @@ run_tool <- function(config) {
 
   dtm_result <- if (is.null(config$dtm)) {
     generated <- make_dtm(original_las, config$dtm_resolution)
-    terra::writeRaster(generated$dtm, file.path(stage_dir, "dtm_full.tif"), overwrite = TRUE)
+    write_geotiff(generated$dtm, file.path(stage_dir, "dtm_full.tif"))
+    # Heights come from the written Float32 DTM, as in the inventory readers.
+    generated$dtm <- terra::rast(file.path(stage_dir, "dtm_full.tif"))
     generated
   } else {
     load_supplied_dtm(
@@ -667,15 +698,12 @@ run_tool <- function(config) {
   }
   if (!is.null(aoi)) {
     aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
-    terra::writeRaster(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"), overwrite = TRUE)
+    write_geotiff(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"))
   }
-  normalized <- lidR::normalize_height(
-    if (is.null(dtm_result$las)) original_las else dtm_result$las,
-    dtm_result$dtm
-  )
-  if (any(!is.finite(normalized@data$Z))) {
-    abort("DTM has missing or non-finite cells under point-cloud points")
-  }
+  normalized <- if (is.null(dtm_result$las)) original_las else dtm_result$las
+  rm(original_las)
+  normalized@data <- normalize_inventory_points(normalized@data, dtm_result$dtm)
+  normalized <- lidR::las_update(normalized)
 
   specs <- config$segmentation_specs
   inventory_las <- normalized
@@ -685,8 +713,7 @@ run_tool <- function(config) {
     csp <- run_csp(normalized, config, stage_dir)
     csp_seed_count <- nrow(csp$seeds)
     csp_unassigned_point_count <- csp$unassigned_point_count
-    original_las@data <- original_data
-    write_csp_cloud(original_las, csp$ids, file.path(stage_dir, "segmented_csp.laz"))
+    write_csp_cloud(files, source_crs, csp$ids, file.path(stage_dir, "segmented_csp.laz"))
     inventory_las <- normalized
     inventory_las <- lidR::add_lasattribute(inventory_las, csp$ids, "PredInstance_CSP", "CSP tree instance ID")
     specs <- c(specs, list(list(instance = "PredInstance_CSP", source = "CSP", species = NULL, species_prob = NULL)))
@@ -695,10 +722,11 @@ run_tool <- function(config) {
   validate_specs(inventory_las, specs)
   inventories <- list()
   for (spec in specs) {
-    result <- inventory_for_spec(inventory_las, spec, config, aoi, las_crs)
+    result <- inventory_from_points(inventory_las@data, spec, config, aoi, las_crs)
     slug <- gsub("[^A-Za-z0-9_]+", "_", spec$source)
     inventories[[slug]] <- result
   }
+  if (config$enable_csp) inventories[["CSP"]] <- add_seed_columns(inventories[["CSP"]], csp$seeds)
   exports <- write_outputs(inventories, area, stage_dir, config, las_crs)
 
   metadata <- list(
@@ -724,7 +752,7 @@ run_tool <- function(config) {
     geometry_threads = config$geometry_threads,
     voxel_resolution_m = config$voxel_resolution
   )
-  jsonlite::write_json(metadata, file.path(stage_dir, "run_metadata.json"), auto_unbox = TRUE, pretty = TRUE, na = "null")
+  write_debug_json(config, metadata, file.path(stage_dir, "run_metadata.json"))
   completed <- Sys.time()
   resources <- list(
     elapsed_seconds = as.numeric(difftime(completed, started, units = "secs")),
@@ -735,7 +763,7 @@ run_tool <- function(config) {
     geometry_threads = config$geometry_threads,
     note = "Process-local VmHWM only; container/cgroup telemetry is recorded by benchmark runs."
   )
-  jsonlite::write_json(resources, file.path(stage_dir, "resource_summary.json"), auto_unbox = TRUE, pretty = TRUE, na = "null")
+  write_debug_json(config, resources, file.path(stage_dir, "resource_summary.json"))
   write_inventory_manifest(exports, config, las_crs, dtm_result, stage_dir)
 
   publish_stage(stage_dir, config$output_dir)

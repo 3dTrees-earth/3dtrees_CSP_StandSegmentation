@@ -57,8 +57,9 @@ class ParallelTests(unittest.TestCase):
         batches = list(parallel.batches(nodes, 2000000))
         self.assertEqual([size for _, _, size in batches], [60*mib, 20*mib])
         self.assertEqual(sum(count for _, count, _ in batches), 1500000)
-        with self.assertRaisesRegex(ValueError, 'queue budget'):
-            list(parallel.batches(nodes, 2000000, 32*mib))
+        # A node above the queue size is read alone, not refused.
+        self.assertEqual([size for _, _, size in parallel.batches(nodes, 2000000, 32*mib)],
+                         [40*mib, 20*mib, 20*mib])
 
     def test_worker_failure_does_not_return_index(self):
         config = dict(configuration(), index_workers=2)
@@ -89,9 +90,6 @@ class ParallelTests(unittest.TestCase):
         original = owned.identity(config['input'])
         with patch.object(owned, 'identity', side_effect=[original, dict(original, mtime_ns=0)]):
             with self.assertRaisesRegex(ValueError, 'changed during'):
-                owned.build_index(copy.deepcopy(config))
-        with patch.object(parallel, 'MAX_NODES', 1):
-            with self.assertRaisesRegex(ValueError, 'metadata budget'):
                 owned.build_index(copy.deepcopy(config))
 
 if __name__ == '__main__':

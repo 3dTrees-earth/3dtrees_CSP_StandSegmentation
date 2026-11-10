@@ -1,5 +1,3 @@
-source(file.path(dirname(normalizePath(sys.frame(1)$ofile)), "inventory_policy.R"), local = TRUE)
-
 abort <- function(message) {
   stop(message, call. = FALSE)
 }
@@ -50,9 +48,6 @@ segmentation_spec <- function(instance, species = NULL, species_prob = NULL) {
 }
 
 validate_owned_config <- function(config) {
-  if (config$inventory_retained_points < inventory_large_instance_sample_limit + config$dbh_band_points) {
-    abort("--inventory-retained-points must hold one large tree: sample limit + --dbh-band-points")
-  }
   if (config$enable_csp) abort("Owned COPC inventory cannot be combined with --enable-csp")
   if (config$inventory_workers + config$inventory_decode_threads > 20L) {
     abort("Owned inventory workers + shared decode threads must be at most 20 CPUs")
@@ -67,12 +62,21 @@ input_is_copc <- function(path) {
     identical(rawToChar(bytes[378:381]), "copc")
 }
 
+# Point count from the LAS public header: the 64-bit count of LAS 1.4 (offset
+# 247), else the legacy 32-bit count (offset 107). lidR's header reader stops
+# at 2^31 points, which merged TLS plots exceed.
 input_point_count <- function(files) {
-  sum(vapply(files, function(path) header_point_count(lidR::readLASheader(path)), numeric(1)))
+  sum(vapply(files, function(path) {
+    header <- readBin(path, raw(), 255L)
+    uint32 <- function(offset) sum(as.numeric(header[offset + 1:4]) * 256^(0:3))
+    if (length(header) >= 255L && as.integer(header[[26L]]) >= 4L) {
+      uint32(247L) + uint32(251L) * 2^32
+    } else uint32(107L)
+  }, numeric(1)))
 }
 
 # Partitions slow down superlinearly at about 7 M points each (925.7 M-point
-# benchmark, workflow/resource_request.py), so aim for about 3 M.
+# benchmark, Sep 2026), so aim for about 3 M.
 default_inventory_partitions <- function(points) {
   wanted <- max(64, ceiling(points / 3e6))
   as.integer(min(4096, 2^ceiling(log2(wanted))))
@@ -137,7 +141,6 @@ usage <- function() {
     "  --inventory-buffer METRES           Owned window initial buffer (default: 20)",
     "  --inventory-batch-points COUNT      Max COPC node batch (default: 1000000)",
     "  --inventory-prefetch-mb MIB         Shared in-memory queue (default: 256; max: 16384)",
-    "  --inventory-retained-points COUNT   Window retention budget (default: 40000000)",
     "  --inventory-decode-threads COUNT    COPC decode threads per worker (default: 4)",
     "  --inventory-workers INTEGER         Parallel instance partitions (default: 1)",
     "  --random-seed INTEGER              RANSAC seed (default: 42)",
@@ -160,11 +163,13 @@ usage <- function() {
     "  --slice-increment METRES           Inventory slice step (default: 0.2)",
     "  --slice-width METRES               Inventory slice width (default: 0.1)",
     "  --max-dbh METRES                   Maximum accepted DBH (default: 1)",
-    "  --dbh-band-points N                Stem-band points kept per tree for DBH; above it",
-    "                                     points are merged from 1 mm voxels up (default: 1000000)",
     "  --dbh-runs N                       Upstream DBH fits per tree; the median is reported (default: 5)",
-    "  --dbh-evidence true|false          Fill the inventory's dbh_fits, dbh_slices and crown_hull",
-    "                                     columns (default: true)",
+    "  --metrics-grid METRES              DBH, height, crown and position use the first point per tree",
+    "                                     in each grid cell; point count, species and FM fields use",
+    "                                     every point; 0 measures every point (default: 0.01)",
+    "  --dbh-evidence true|false          Fill dbh_fits, dbh_slices and crown_hull (default: true)",
+    "  --debug-outputs true|false         Also write manifest.json, run_metadata.json,",
+    "                                     resource_summary.json and instance_index.json (default: false)",
     "  --scratch-dir DIR                  Intermediate files (default: $TMPDIR, else next to output)",
     sep = "\n"
   )
@@ -198,7 +203,6 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     inventory_core_size = 50,
     inventory_buffer = 20,
     inventory_batch_points = 2000000L,
-    inventory_retained_points = 40000000L,
     inventory_decode_threads = 4L,
     inventory_prefetch_mb = 256L,
     random_seed = 42L,
@@ -219,9 +223,10 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     slice_increment = 0.2,
     slice_width = 0.1,
     max_dbh = 1,
-    dbh_band_points = inventory_dbh_band_point_budget,
     dbh_runs = 5L,
+    metrics_grid = 0.01,
     dbh_evidence = TRUE,
+    debug_outputs = FALSE,
     scratch_dir = NULL
   )
 
@@ -280,7 +285,6 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--inventory-core-size") config$inventory_core_size <- parse_number(value, key, 0.001)
     else if (key == "--inventory-buffer") config$inventory_buffer <- parse_number(value, key, 0)
     else if (key == "--inventory-batch-points") config$inventory_batch_points <- parse_number(value, key, 1, 10000000, TRUE)
-    else if (key == "--inventory-retained-points") config$inventory_retained_points <- parse_number(value, key, inventory_instance_point_limit, 100000000, TRUE)
     else if (key == "--inventory-prefetch-mb") config$inventory_prefetch_mb <- parse_number(value, key, 1, 16384, TRUE)
     else if (key == "--inventory-decode-threads") config$inventory_decode_threads <- parse_number(value, key, 1, 19, TRUE)
     else if (key == "--random-seed") config$random_seed <- parse_number(value, key, 0, .Machine$integer.max, TRUE)
@@ -288,6 +292,7 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--geometry-threads") config$geometry_threads <- parse_number(value, key, 1, 256, TRUE)
     else if (key == "--voxel-resolution") config$voxel_resolution <- parse_number(value, key, 0.001)
     else if (key == "--geometry-k") config$geometry_k <- parse_number(value, key, 1, 1000, TRUE)
+    else if (key == "--metrics-grid") config$metrics_grid <- parse_number(value, key, 0, 1)
     else if (key == "--verticality-weight") config$verticality_weight <- parse_number(value, key, 0, 1)
     else if (key == "--linearity-weight") config$linearity_weight <- parse_number(value, key, 0, 1)
     else if (key == "--sphericity-weight") config$sphericity_weight <- parse_number(value, key, 0, 1)
@@ -301,9 +306,9 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--slice-increment") config$slice_increment <- parse_number(value, key, 0.001)
     else if (key == "--slice-width") config$slice_width <- parse_number(value, key, 0.001)
     else if (key == "--max-dbh") config$max_dbh <- parse_number(value, key, 0.001)
-    else if (key == "--dbh-band-points") config$dbh_band_points <- parse_number(value, key, 1000, 100000000, TRUE)
     else if (key == "--dbh-runs") config$dbh_runs <- parse_number(value, key, 1, 99, TRUE)
     else if (key == "--dbh-evidence") config$dbh_evidence <- parse_bool(value, key)
+    else if (key == "--debug-outputs") config$debug_outputs <- parse_bool(value, key)
     else if (key == "--scratch-dir") config$scratch_dir <- value
     else abort(sprintf("Unknown option: %s", key))
   }

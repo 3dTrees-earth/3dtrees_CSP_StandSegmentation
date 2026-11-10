@@ -21,7 +21,6 @@ import numpy as np
 from scipy.spatial import ConvexHull, QhullError
 
 MAX_TRACKED_INSTANCE_IDS = 1_000_000
-from inventory_policy import INSTANCE_POINT_LIMIT as STANDARD_INSTANCE_POINT_LIMIT
 
 
 def update_hull(previous: np.ndarray, x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -259,19 +258,12 @@ def process(config: dict) -> dict:
     shutil.rmtree(bucket_root)
 
     largest_instances = {}
-    oversized_instances = {}
     for slug, totals in instance_counts.items():
         if totals:
             instance_id, count = max(totals.items(), key=lambda item: item[1])
             largest_instances[slug] = {"instance_id": instance_id, "points": count}
-        oversized_instances[slug] = [
-            {"instance_id": instance_id, "points": count}
-            for instance_id, count in sorted(totals.items())
-            if count > STANDARD_INSTANCE_POINT_LIMIT
-        ]
     (output_dir / "partition_summary.json").write_text(json.dumps({
         "largest_instances": largest_instances,
-        "oversized_instances": oversized_instances,
         "instance_counts": {slug: len(totals) for slug, totals in instance_counts.items()},
     }, indent=2) + "\n")
 
@@ -281,7 +273,6 @@ def process(config: dict) -> dict:
         "selector": "python_sequential_selective" if selective else "python_sequential_all",
         "assigned_points": total_assigned, "xy_spool_bytes": 0,
         "largest_instances": largest_instances,
-        "oversized_instances": oversized_instances,
         "hull_vertex_count": len(hull),
         "spatial_bucket_bytes": bucket_bytes,
         "loaded_dimensions": loaded, "dropped_dimensions": dropped,

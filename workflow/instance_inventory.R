@@ -1,4 +1,8 @@
 # Canonical instance measurements. Readers supply normalized rows in source order.
+
+# Points read per batch from a COPC pipe or partition file.
+inventory_batch_points <- 1000000L
+
 normalize_inventory_points <- function(points, dtm) {
   terrain <- terra::extract(dtm, data.frame(X = points$X, Y = points$Y), ID = FALSE)[[1L]]
   if (any(!is.finite(terrain))) abort("DTM has missing or non-finite cells under inventoried points")
@@ -33,49 +37,20 @@ in_dbh_band <- function(points, config) {
   is.finite(points$Z) & points$Z > config$slice_min & points$Z < config$slice_max
 }
 
-# Keep every stem-band point while the band fits the budget. Above it, keep
-# the first point (source order) per voxel, starting at the policy's initial
-# size and doubling until the band fits; once thinned, later batches use the
-# same grid. Original coordinates are kept, nothing is averaged.
-voxel_keys <- function(points, size) {
+# Grid cell of every point on one world-aligned grid (absolute Z, so the cell
+# does not depend on the terrain model or on tile and window borders).
+grid_keys <- function(points, size) {
   z <- if ("Zref" %in% names(points)) points$Zref else points$Z
   data.table::data.table(kx = floor(points$X / size), ky = floor(points$Y / size), kz = floor(z / size))
 }
 
-dbh_band_keep <- function(points, budget, voxel = 0) {
-  if (voxel <= 0 && nrow(points) <= budget) return(list(keep = rep(TRUE, nrow(points)), voxel = 0))
-  size <- if (voxel > 0) voxel else inventory_dbh_band_initial_voxel_m
-  repeat {
-    keep <- !duplicated(voxel_keys(points, size))
-    if (sum(keep) <= budget) return(list(keep = keep, voxel = size))
-    size <- size * 2
-  }
-}
-
-with_dbh_band <- function(result, band_points, source_points, voxel) {
-  result[, `:=`(dbh_band_points = as.numeric(band_points),
-                dbh_band_source_points = as.numeric(source_points),
-                dbh_band_voxel_m = voxel)]
-  result
-}
-
-measure_inventory_points <- function(points, spec, config, aoi, crs) {
-  # Preserve the partition reader's existing grouped calculation and RNG order.
-  # Split only when the aggregate stem band exceeds the per-tree budget.
-  budget <- config$dbh_band_points
-  measure <- function(selected) {
-    band <- in_dbh_band(selected, config)
-    if (sum(band) <= budget) return(inventory_for_spec(inventory_las(selected), spec, config, aoi, crs))
-    thinned <- dbh_band_keep(selected[band], budget)
-    keep <- rep(TRUE, nrow(selected))
-    keep[which(band)[!thinned$keep]] <- FALSE
-    result <- inventory_for_spec(inventory_las(selected[keep]), spec, config, aoi, crs)
-    result[, point_count := nrow(selected)]
-    with_dbh_band(result, sum(thinned$keep), sum(band), thinned$voxel)
-  }
-  if (sum(in_dbh_band(points, config)) <= budget) return(measure(points))
-  groups <- split(points, by = spec$instance, keep.by = TRUE)
-  data.table::rbindlist(lapply(groups, measure), use.names = TRUE, fill = TRUE)
+# One point of a tree per grid cell: the smallest by X, Y, Z, so the choice
+# does not depend on file, window or worker order. Coordinates are kept.
+grid_points <- function(points, size) {
+  if (!size) return(points)
+  z <- if ("Zref" %in% names(points)) points$Zref else points$Z
+  ord <- order(points$X, points$Y, z)
+  points[ord][!duplicated(grid_keys(points, size)[ord])]
 }
 
 quality_label <- function(code, dbh) {
@@ -91,60 +66,12 @@ quality_label <- function(code, dbh) {
   result
 }
 
-modal_value <- function(values) {
-  values <- values[!is.na(values) & is.finite(values) & values >= 0]
-  if (!length(values)) return(NA_real_)
-  counts <- table(values)
-  as.numeric(sort(names(counts)[counts == max(counts)])[1L])
-}
-
-species_by_instance <- function(points, spec) {
-  id <- spec$instance
-  species <- spec$species
-  probability <- spec$species_prob
-  points[, {
-    chosen <- modal_value(get(species))
-    valid_species <- get(species)[!is.na(get(species)) & is.finite(get(species)) & get(species) >= 0]
-    matching_prob <- get(probability)[get(species) == chosen & is.finite(get(probability)) & get(probability) >= 0]
-    list(
-      species_id = chosen,
-      species_prob = if (length(matching_prob)) stats::median(matching_prob) else NA_real_,
-      species_conflict_fraction = if (length(valid_species)) 1 - sum(valid_species == chosen) / length(valid_species) else NA_real_
-    )
-  }, by = id]
-}
-
 # Every distinct FM score with its point count, most points first, as a JSON
 # array: an instance merged from several FM instances keeps each one's score.
 fm_score_values <- function(counts) {
   if (!length(counts)) return(NA_character_)
   counts <- counts[order(-counts, as.numeric(names(counts)))]
   sprintf("[%s]", paste(sprintf('{"score":%s,"point_count":%.0f}', names(counts), counts), collapse = ","))
-}
-
-score_counts <- function(scores) {
-  scores <- scores[is.finite(scores) & scores >= 0]
-  counts <- table(as.character(scores))
-  stats::setNames(as.numeric(counts), names(counts))
-}
-
-fm_by_instance <- function(points, instance) {
-  has_score <- "PredScore_FM" %in% names(points)
-  has_semantic <- "PredSemantic_FM" %in% names(points)
-  points[, {
-    counts <- score_counts(if (has_score) get("PredScore_FM") else numeric())
-    semantics <- if (has_semantic) get("PredSemantic_FM") else numeric()
-    wood <- if (has_semantic) sum(semantics == 1, na.rm = TRUE) else NA_integer_
-    leaf <- if (has_semantic) sum(semantics == 2, na.rm = TRUE) else NA_integer_
-    classified <- if (has_semantic) wood + leaf else 0L
-    list(
-      pred_score_fm_values = fm_score_values(counts),
-      wood_point_count = wood,
-      leaf_point_count = leaf,
-      wood_share = if (classified > 0L) wood / classified else NA_real_,
-      leaf_share = if (classified > 0L) leaf / classified else NA_real_
-    )
-  }, by = instance]
 }
 
 filter_inventory_to_aoi <- function(inventory, aoi, crs) {
@@ -238,279 +165,157 @@ measure_tree <- function(points, instance, id, config) {
   result
 }
 
-measure_trees <- function(las, instance, config) {
-  columns <- intersect(c("X", "Y", "Z", "Zref", instance), names(las@data))
-  trees <- split(las@data[!is.na(get(instance)) & !(get(instance) %in% config$non_tree_ids), ..columns],
-                 by = instance, keep.by = TRUE)
-  measured <- data.table::rbindlist(lapply(trees, function(points) {
-    measure_tree(data.table::copy(points), instance, points[[instance]][[1L]], config)
-  }), use.names = TRUE, fill = TRUE)
-  if (!nrow(measured)) {
-    measured <- data.table::data.table(
-      instance_id = numeric(), X = numeric(), Y = numeric(), Z = numeric(),
-      DBH = numeric(), quality_flag = integer(), Height = numeric(), ConvexHullArea = numeric(),
-      dbh_runs = integer(), dbh_runs_fitted = integer(), dbh_spread_m = numeric())
+inventory_columns <- c(
+  "segmentation_source", "instance_dimension", "instance_id", "x", "y", "z",
+  "dbh_m", "height_m", "convex_hull_area_m2", "point_count", "metrics_point_count",
+  "species_id", "species_prob", "species_conflict_fraction",
+  "pred_score_fm_values", "wood_point_count", "leaf_point_count",
+  "wood_share", "leaf_share", "dbh_quality_code", "dbh_quality_label",
+  "dbh_runs", "dbh_runs_fitted", "dbh_spread_m", "dbh_band_points"
+)
+
+# One tree's row from its --metrics-grid cloud (the instance column set):
+# upstream's measurements where it produced them, otherwise the cloud's median
+# position, lowest point, extent and convex hull.
+measure_tree_geometry <- function(points, spec, id, config) {
+  z_original <- if ("Zref" %in% names(points)) points$Zref else points$Z
+  fit <- measure_tree(data.table::copy(points), spec$instance, id, config)
+  if (is.null(fit)) {
+    fit <- data.table::data.table(X = NA_real_, Y = NA_real_, Z = NA_real_, DBH = NA_real_,
+                                  quality_flag = NA_real_, Height = NA_real_, ConvexHullArea = NA_real_,
+                                  dbh_runs = NA_integer_, dbh_runs_fitted = NA_integer_, dbh_spread_m = NA_real_)
   }
-  measured
+  code <- data.table::fcoalesce(as.integer(fit$quality_flag), 9L)
+  data.table::data.table(
+    segmentation_source = spec$source, instance_dimension = spec$instance, instance_id = as.numeric(id),
+    x = data.table::fcoalesce(as.numeric(fit$X), stats::median(points$X)),
+    y = data.table::fcoalesce(as.numeric(fit$Y), stats::median(points$Y)),
+    z = data.table::fcoalesce(as.numeric(fit$Z), min(z_original)),
+    dbh_m = as.numeric(fit$DBH),
+    height_m = data.table::fcoalesce(as.numeric(fit$Height), max(points$Z) - min(points$Z)),
+    convex_hull_area_m2 = data.table::fcoalesce(as.numeric(fit$ConvexHullArea), polygon_area(points$X, points$Y)),
+    metrics_point_count = nrow(points),
+    dbh_quality_code = code, dbh_quality_label = quality_label(code, fit$DBH),
+    dbh_runs = as.integer(fit$dbh_runs), dbh_runs_fitted = as.integer(fit$dbh_runs_fitted),
+    dbh_spread_m = as.numeric(fit$dbh_spread_m),
+    dbh_band_points = as.numeric(sum(in_dbh_band(points, config)))
+  )
 }
 
-inventory_for_spec <- function(las, spec, config, aoi, crs) {
-  instance <- spec$instance
-  available <- names(las@data)
-  point_columns <- unique(c(
-    "X", "Y", "Z", intersect("Zref", available),
-    instance, spec$species, spec$species_prob,
-    if (identical(spec$source, "FM")) intersect(c("PredScore_FM", "PredSemantic_FM"), available)
-  ))
-  points <- las@data[
-    !is.na(get(instance)) & is.finite(get(instance)) &
-      get(instance) >= 0 & !(get(instance) %in% config$non_tree_ids),
-    ..point_columns
-  ]
-  if (!nrow(points)) abort(sprintf("No valid instances remain for requested dimension %s", instance))
+add_value_counts <- function(counts, values) {
+  batch <- data.table::data.table(value = values)[is.finite(value), .(n = as.numeric(.N)), by = value]
+  data.table::rbindlist(list(counts, batch))[, .(n = sum(n)), by = value]
+}
 
-  z_original <- if ("Zref" %in% names(points)) "Zref" else "Z"
-  base <- points[, list(
-    point_count = .N,
-    fallback_x = stats::median(X),
-    fallback_y = stats::median(Y),
-    fallback_z = min(get(z_original), na.rm = TRUE),
-    fallback_height = max(Z, na.rm = TRUE) - min(Z, na.rm = TRUE),
-    fallback_hull = polygon_area(X, Y),
-    dbh_band_points = as.numeric(sum(Z > config$slice_min & Z < config$slice_max, na.rm = TRUE))
-  ), by = instance]
-  data.table::setnames(base, instance, "instance_id")
+median_of_counts <- function(counts) {
+  if (is.null(counts) || !nrow(counts)) return(NA_real_)
+  counts <- counts[order(value)]
+  cumulative <- cumsum(counts$n)
+  total <- cumulative[[nrow(counts)]]
+  lower <- counts$value[[which(cumulative >= (total + 1) %/% 2)[[1L]]]]
+  upper <- counts$value[[which(cumulative >= total %/% 2 + 1)[[1L]]]]
+  (lower + upper) / 2
+}
 
-  measured <- measure_trees(las, instance, config)
+is_fm_spec <- function(spec) identical(spec$instance, "PredInstance_FM") || identical(spec$source, "FM")
 
-  result <- merge(base, measured, by = "instance_id", all.x = TRUE, sort = FALSE)
-  result[, `:=`(
-    segmentation_source = spec$source,
-    instance_dimension = instance,
-    x = data.table::fcoalesce(X, fallback_x),
-    y = data.table::fcoalesce(Y, fallback_y),
-    z = data.table::fcoalesce(Z, fallback_z),
-    dbh_m = DBH,
-    height_m = data.table::fcoalesce(Height, fallback_height),
-    convex_hull_area_m2 = data.table::fcoalesce(ConvexHullArea, fallback_hull),
-    dbh_quality_code = data.table::fcoalesce(as.integer(quality_flag), 9L),
-    dbh_band_source_points = dbh_band_points,
-    dbh_band_voxel_m = 0
-  )]
-  result[, dbh_quality_label := quality_label(dbh_quality_code, dbh_m)]
-  result[, inventory_method := "standard"]
+# Every tree is collected the same way, in one batch or many: its
+# --metrics-grid cloud for the geometry, and exact counts of every input point
+# for point_count, species, probability and the FM fields.
+new_tree <- function() {
+  list(count = 0, grid = NULL, compacted = 0, species = NULL, probability = NULL,
+       scores = NULL, semantic = FALSE, wood = 0, leaf = 0)
+}
 
+add_tree_points <- function(tree, points, spec, config) {
+  tree$count <- tree$count + nrow(points)
+  coordinates <- intersect(c("X", "Y", "Z", "Zref"), names(points))
+  tree$grid <- data.table::rbindlist(list(tree$grid, grid_points(points[, ..coordinates], config$metrics_grid)))
+  # Re-reduce once the cloud has doubled: memory stays near the grid cloud
+  # and the total work stays proportional to the points read.
+  if (config$metrics_grid && nrow(tree$grid) > 2 * max(tree$compacted, 1e6)) {
+    tree$grid <- grid_points(tree$grid, config$metrics_grid)
+    tree$compacted <- nrow(tree$grid)
+  }
   if (!is.null(spec$species)) {
-    species <- species_by_instance(points, spec)
-    data.table::setnames(species, instance, "instance_id")
-    result <- merge(result, species, by = "instance_id", all.x = TRUE, sort = FALSE)
+    species <- points[[spec$species]]
+    valid <- is.finite(species) & species >= 0
+    tree$species <- add_value_counts(tree$species, species[valid])
+    if (!is.null(spec$species_prob)) {
+      probability <- points[[spec$species_prob]]
+      counted <- valid & is.finite(probability) & probability >= 0
+      batch <- data.table::data.table(species = species[counted], value = probability[counted])
+      tree$probability <- data.table::rbindlist(list(tree$probability, batch[, .(n = as.numeric(.N)), by = .(species, value)]))[
+        , .(n = sum(n)), by = .(species, value)]
+    }
   }
-
-  if (identical(instance, "PredInstance_FM") || identical(spec$source, "FM")) {
-    fm <- fm_by_instance(points, instance)
-    data.table::setnames(fm, instance, "instance_id")
-    result <- merge(result, fm, by = "instance_id", all.x = TRUE, sort = FALSE)
+  if (is_fm_spec(spec) && "PredScore_FM" %in% names(points)) {
+    scores <- points$PredScore_FM
+    tree$scores <- add_value_counts(tree$scores, scores[scores >= 0])
   }
-
-  keep <- c(
-    "segmentation_source", "instance_dimension", "instance_id", "x", "y", "z",
-    "dbh_m", "height_m", "convex_hull_area_m2", "point_count",
-    "species_id", "species_prob", "species_conflict_fraction",
-    "pred_score_fm_values", "wood_point_count", "leaf_point_count",
-    "wood_share", "leaf_share", "dbh_quality_code", "dbh_quality_label",
-    "dbh_runs", "dbh_runs_fitted", "dbh_spread_m",
-    "dbh_band_points", "dbh_band_source_points", "dbh_band_voxel_m",
-    "inventory_method"
-  )
-  result <- result[, intersect(keep, names(result)), with = FALSE]
-  result <- filter_inventory_to_aoi(result, aoi, crs)
-  attr(result, "segmentation_source") <- spec$source
-  attr(result, "instance_dimension") <- instance
-  result
+  if (is_fm_spec(spec) && "PredSemantic_FM" %in% names(points)) {
+    tree$semantic <- TRUE
+    tree$wood <- tree$wood + sum(points$PredSemantic_FM == 1, na.rm = TRUE)
+    tree$leaf <- tree$leaf + sum(points$PredSemantic_FM == 2, na.rm = TRUE)
+  }
+  tree
 }
 
-update_streaming_hull <- function(hull, x, y) {
-  candidate <- data.table::data.table(x = x, y = y)
-  if (nrow(candidate) > 3L) candidate <- candidate[chull(x, y)]
-  if (!is.null(hull)) candidate <- data.table::rbindlist(list(hull, candidate))
-  if (nrow(candidate) > 3L) candidate <- candidate[chull(x, y)]
-  candidate
+# The most frequent species (the smallest id on ties), the median probability
+# of its points, and the share of points voting for another species.
+species_vote <- function(tree) {
+  if (is.null(tree$species) || !nrow(tree$species)) return(list(NA_real_, NA_real_, NA_real_))
+  chosen <- min(tree$species[n == max(n), value])
+  votes <- tree$species[value == chosen, n]
+  probability <- if (is.null(tree$probability)) NULL else tree$probability[species == chosen, .(value, n)]
+  list(chosen, median_of_counts(probability), 1 - votes / sum(tree$species$n))
 }
 
-new_large_instance_summary <- function(expected_points) {
-  list(
-    expected_points = as.numeric(expected_points), count = 0,
-    min_zref = Inf, min_z = Inf, max_z = -Inf, hull = NULL,
-    sample = NULL, species_counts = numeric(), valid_species_count = 0,
-    wood_count = 0, leaf_count = 0, has_semantic = FALSE, score_counts = numeric(),
-    crown_hull = NULL,
-    band = NULL, band_keys = NULL, band_source_points = 0, band_voxel = 0
-  )
+fm_fields <- function(tree) {
+  scores <- if (is.null(tree$scores) || !nrow(tree$scores)) numeric() else
+    stats::setNames(tree$scores$n, as.character(tree$scores$value))
+  classified <- tree$wood + tree$leaf
+  list(fm_score_values(scores),
+       if (tree$semantic) tree$wood else NA_real_, if (tree$semantic) tree$leaf else NA_real_,
+       if (tree$semantic && classified > 0) tree$wood / classified else NA_real_,
+       if (tree$semantic && classified > 0) tree$leaf / classified else NA_real_)
 }
 
-update_large_instance_summary <- function(state, points, spec, config) {
-  previous_count <- state$count
-  state$count <- previous_count + nrow(points)
-  state$min_zref <- min(state$min_zref, points$Zref)
-  state$min_z <- min(state$min_z, points$Z)
-  state$max_z <- max(state$max_z, points$Z)
-  state$hull <- update_streaming_hull(state$hull, points$X, points$Y)
-  # Same crown definition as the full measurement: points above 0.5 m.
-  crown <- points$Z > 0.5
-  if (any(crown)) state$crown_hull <- update_streaming_hull(state$crown_hull, points$X[crown], points$Y[crown])
-
-  # Stem band for DBH, in source order, bounded by the per-tree budget.
-  band <- in_dbh_band(points, config)
-  if (any(band)) {
-    state$band_source_points <- state$band_source_points + sum(band)
-    incoming <- points[band, .(X, Y, Z, Zref)]
-    if (state$band_voxel > 0) {
-      # Already thinned: drop incoming points whose voxel is taken by an
-      # earlier point. Same result as re-thinning the whole band, without
-      # rescanning the retained points on every batch.
-      keys <- voxel_keys(incoming, state$band_voxel)
-      keep <- !duplicated(keys)
-      keep[keys[state$band_keys, on = c("kx", "ky", "kz"), which = TRUE, nomatch = 0L]] <- FALSE
-      incoming <- incoming[keep]
-      state$band_keys <- data.table::rbindlist(list(state$band_keys, keys[keep]))
-    }
-    state$band <- data.table::rbindlist(list(state$band, incoming))
-    if (nrow(state$band) > config$dbh_band_points) {
-      thinned <- dbh_band_keep(state$band, config$dbh_band_points, state$band_voxel)
-      state$band <- state$band[thinned$keep]
-      state$band_voxel <- thinned$voxel
-      state$band_keys <- voxel_keys(state$band, state$band_voxel)
-    }
+finish_tree <- function(tree, id, spec, config, aoi, crs) {
+  grid <- grid_points(tree$grid, config$metrics_grid)
+  data.table::set(grid, j = spec$instance, value = as.numeric(id))
+  row <- measure_tree_geometry(grid, spec, id, config)
+  row[, point_count := tree$count]
+  if (!is.null(spec$species)) {
+    row[, c("species_id", "species_prob", "species_conflict_fraction") := species_vote(tree)]
   }
-
-  # A fixed stride gives a deterministic, bounded sample across the full
-  # source order. Only medians use it; counts, extrema and hull remain exact.
-  stride <- max(1, ceiling(state$expected_points / inventory_large_instance_sample_limit))
-  positions <- which(((previous_count + seq_len(nrow(points)) - 1) %% stride) == 0)
-  if (length(positions)) {
-    sample_columns <- intersect(c("X", "Y", spec$species, spec$species_prob,
-                                  "PredScore_FM"), names(points))
-    selected <- points[positions, ..sample_columns]
-    state$sample <- if (is.null(state$sample)) selected else
-      data.table::rbindlist(list(state$sample, selected), use.names = TRUE)
+  if (is_fm_spec(spec)) {
+    row[, c("pred_score_fm_values", "wood_point_count", "leaf_point_count", "wood_share", "leaf_share") :=
+          fm_fields(tree)]
   }
-
-  if (!is.null(spec$species) && spec$species %in% names(points)) {
-    values <- points[[spec$species]]
-    values <- values[is.finite(values) & values >= 0]
-    state$valid_species_count <- state$valid_species_count + length(values)
-    if (length(values)) {
-      counts <- table(values)
-      for (name in names(counts)) {
-        if (!name %in% names(state$species_counts)) state$species_counts[name] <- 0
-        state$species_counts[name] <- state$species_counts[name] + as.numeric(counts[[name]])
-      }
-    }
-  }
-  if (identical(spec$source, "FM")) {
-    if ("PredSemantic_FM" %in% names(points)) {
-      state$has_semantic <- TRUE
-      state$wood_count <- state$wood_count + sum(points$PredSemantic_FM == 1, na.rm = TRUE)
-      state$leaf_count <- state$leaf_count + sum(points$PredSemantic_FM == 2, na.rm = TRUE)
-    }
-    if ("PredScore_FM" %in% names(points)) {
-      # Exact counts over every batch, not the sample.
-      add <- score_counts(points$PredScore_FM)
-      keys <- union(names(state$score_counts), names(add))
-      total <- stats::setNames(numeric(length(keys)), keys)
-      total[names(state$score_counts)] <- state$score_counts
-      total[names(add)] <- total[names(add)] + add
-      state$score_counts <- total
-    }
-  }
-  state
+  data.table::setcolorder(row, intersect(inventory_columns, names(row)))
+  filter_inventory_to_aoi(row, aoi, crs)
 }
 
-# DBH, its quality and the DBH-height position come from the retained stem
-# band; counts, height, crown and species stay exact streaming summaries.
-large_instance_dbh <- function(state, id, spec, config, crs) {
-  if (is.null(state$band) || nrow(state$band) < 3L) return(NULL)
-  band <- data.table::copy(state$band)
-  data.table::set(band, j = spec$instance, value = as.numeric(id))
-  band_spec <- list(instance = spec$instance, source = spec$source)
-  measured <- inventory_for_spec(inventory_las(band), band_spec, config, NULL, crs)
-  if (!nrow(measured) || measured$dbh_quality_code[[1L]] == 9L) return(NULL)
-  measured[1L]
+# Rows of one segmentation, sorted by instance and labelled with it.
+inventory_table <- function(rows, spec) {
+  inventory <- data.table::rbindlist(rows, use.names = TRUE, fill = TRUE)
+  if (nrow(inventory)) data.table::setorder(inventory, instance_id)
+  attr(inventory, "segmentation_source") <- spec$source
+  attr(inventory, "instance_dimension") <- spec$instance
+  inventory
 }
 
-finish_large_instance_summary <- function(state, id, spec, aoi, crs, config,
-                                          method = "streaming_large_instance") {
-  if (state$count != state$expected_points || is.null(state$sample) ||
-      !nrow(state$sample)) {
-    abort(sprintf("Large instance %s has incomplete partition data: %.0f of %.0f points",
-                  id, state$count, state$expected_points))
-  }
-  sample <- state$sample
-  species_id <- NA_real_
-  species_prob <- NA_real_
-  conflict <- NA_real_
-  if (length(state$species_counts)) {
-    winners <- names(state$species_counts)[
-      state$species_counts == max(state$species_counts)]
-    species_id <- min(as.numeric(winners))
-    conflict <- 1 - state$species_counts[[as.character(species_id)]] /
-      state$valid_species_count
-    if (!is.null(spec$species_prob) && spec$species_prob %in% names(sample)) {
-      probabilities <- sample[[spec$species_prob]][
-        sample[[spec$species]] == species_id]
-      probabilities <- probabilities[is.finite(probabilities) & probabilities >= 0]
-      if (length(probabilities)) species_prob <- stats::median(probabilities)
-    }
-  }
-  score_values <- NA_character_
-  wood_count <- NA_real_
-  leaf_count <- NA_real_
-  wood_share <- NA_real_
-  leaf_share <- NA_real_
-  if (identical(spec$source, "FM")) {
-    score_values <- fm_score_values(state$score_counts)
-    if (state$has_semantic) {
-      wood_count <- state$wood_count
-      leaf_count <- state$leaf_count
-      classified <- wood_count + leaf_count
-      if (classified > 0) {
-        wood_share <- wood_count / classified
-        leaf_share <- leaf_count / classified
-      }
-    }
-  }
-  dbh <- large_instance_dbh(state, id, spec, config, crs)
-  # The stem position replaces the sample median only when a DBH was fitted.
-  located <- !is.null(dbh) && is.finite(dbh$dbh_m)
-  crown <- if (is.null(state$crown_hull)) state$hull else state$crown_hull
-  record_crown_hull(config, spec$instance, id, crown$x, crown$y, 2L)
-  result <- data.table::data.table(
-    segmentation_source = spec$source, instance_dimension = spec$instance,
-    instance_id = as.numeric(id),
-    x = if (located) dbh$x else stats::median(sample$X),
-    y = if (located) dbh$y else stats::median(sample$Y),
-    z = if (located) dbh$z else state$min_zref,
-    dbh_m = if (located) dbh$dbh_m else NA_real_,
-    height_m = state$max_z - state$min_z,
-    convex_hull_area_m2 = polygon_area(crown$x, crown$y),
-    point_count = state$count, species_id = species_id,
-    species_prob = species_prob, species_conflict_fraction = conflict,
-    pred_score_fm_values = score_values,
-    wood_point_count = wood_count, leaf_point_count = leaf_count,
-    wood_share = wood_share, leaf_share = leaf_share,
-    dbh_quality_code = if (is.null(dbh)) 9L else dbh$dbh_quality_code,
-    dbh_quality_label = if (is.null(dbh)) "dbh_unavailable" else dbh$dbh_quality_label,
-    dbh_runs = if (is.null(dbh)) NA_integer_ else dbh$dbh_runs,
-    dbh_runs_fitted = if (is.null(dbh)) NA_integer_ else dbh$dbh_runs_fitted,
-    dbh_spread_m = if (is.null(dbh)) NA_real_ else dbh$dbh_spread_m,
-    dbh_band_points = if (is.null(state$band)) 0 else as.numeric(nrow(state$band)),
-    dbh_band_source_points = state$band_source_points,
-    dbh_band_voxel_m = state$band_voxel,
-    inventory_method = method
-  )
-  filter_inventory_to_aoi(result, aoi, crs)
+# Inventory of trees whose points are all in memory (the CSP path and tests).
+inventory_from_points <- function(points, spec, config, aoi, crs) {
+  instance <- spec$instance
+  points <- points[is.finite(get(instance)) & get(instance) >= 0 & !(get(instance) %in% config$non_tree_ids)]
+  if (!nrow(points)) abort(sprintf("No valid instances remain for requested dimension %s", instance))
+  rows <- lapply(split(points, by = instance), function(tree) {
+    finish_tree(add_tree_points(new_tree(), tree, spec, config), tree[[instance]][[1L]], spec, config, aoi, crs)
+  })
+  inventory_table(rows, spec)
 }
-
 
 inventory_layouts <- function(specs) {
   layouts <- list()

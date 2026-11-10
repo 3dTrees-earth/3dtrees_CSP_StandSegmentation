@@ -78,8 +78,6 @@ class ScannerTests(unittest.TestCase):
                                   "partition_summary.json").read_text())
             self.assertEqual(summary["largest_instances"],
                              selected[1]["largest_instances"])
-            self.assertEqual(summary["oversized_instances"],
-                             selected[1]["oversized_instances"])
             for source in (baseline[0] / "partitions").glob("*/*.bin"):
                 target = selected[0] / "partitions" / source.relative_to(
                     baseline[0] / "partitions")
@@ -91,24 +89,6 @@ class ScannerTests(unittest.TestCase):
             full_xy = np.column_stack((points.x, points.y))
             full_hull = ConvexHull(full_xy)
             self.assertAlmostEqual(ConvexHull(vertices).volume, full_hull.volume, places=9)
-
-    def test_scanner_reports_all_large_ids(self):
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            config = {
-                "input": str(FIXTURE), "output_dir": str(root / "partitions"),
-                "hull_path": str(root / "hull.bin"), "partitions": 8,
-                "chunk_points": 5000,
-                "spatial_grid": {"xmin": -50, "ymin": -70, "size": 20,
-                                 "nx": 2, "ny": 2},
-                "layouts": [{"slug": "SAT", "instance": "PredInstance_SAT",
-                             "columns": ["X", "Y", "Z", "PredInstance_SAT"]}],
-                "non_tree_ids": [0],
-            }
-            with patch("stream_inventory_partitions.STANDARD_INSTANCE_POINT_LIMIT", 1):
-                result = process(config)
-            self.assertEqual(len(result["oversized_instances"]["SAT"]), 2)
-            self.assertGreater(result["oversized_instances"]["SAT"][0]["points"], 1)
 
 
 if __name__ == "__main__":

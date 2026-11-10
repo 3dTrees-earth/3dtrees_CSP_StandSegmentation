@@ -17,7 +17,7 @@ terra::values(dtm) <- 2
 dtm_path <- file.path(work, 'dtm.tif')
 terra::writeRaster(dtm, dtm_path)
 base <- c('--input', input, '--instance-attribute', 'PredInstance_FM',
-          '--dtm', dtm_path, '--dtm-workers', '1')
+          '--dtm', dtm_path, '--dtm-workers', '1', '--debug-outputs', 'true')
 expected <- cloud@data[PredInstance_FM > 0, .(point_count = .N), by = PredInstance_FM]
 data.table::setorder(expected, PredInstance_FM)
 config <- parse_cli_args(c(base, '--output-dir', file.path(work, 'extra'),
@@ -38,7 +38,7 @@ missing$output_dir <- file.path(work, 'missing')
 missing$segmentation_specs[[1L]]$attributes <- 'does_not_exist'
 error <- tryCatch({run_tool(missing); NULL}, error = conditionMessage)
 stopifnot(!is.null(error), grepl('does_not_exist', error), !dir.exists(missing$output_dir))
-# Full CSP output preserves requested attributes only, with its new instance ID.
+# The CSP cloud keeps every input dimension and adds its new instance ID.
 for (generated in c(FALSE, TRUE)) {
   csp <- config
   csp$inventory_read_mode <- 'spatial'
@@ -48,9 +48,8 @@ for (generated in c(FALSE, TRUE)) {
   run_tool(csp)
   output <- suppressWarnings(lidR::readLAS(file.path(csp$output_dir, 'segmented_csp.laz'), select = '*'))
   stopifnot(nrow(output@data) == nrow(cloud@data),
-            'PredInstance_CSP' %in% names(output@data),
-            !any(c('unused_2', 'unused_3', 'unused_4') %in% names(output@data)),
-            identical(output@data$unused_1, cloud@data$unused_1))
+            setequal(names(output@data), c(names(cloud@data), 'PredInstance_CSP')),
+            identical(output@data$unused_4, cloud@data$unused_4))
 }
 for (mode in c('copc-owned', 'sequential', 'spatial')) {
   config <- parse_cli_args(c(base, '--output-dir', file.path(work, mode), '--inventory-read-mode', mode))

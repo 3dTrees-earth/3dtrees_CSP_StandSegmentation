@@ -28,8 +28,6 @@ import numpy as np
 
 from stream_inventory_partitions import decompression_groups, update_hull, requested_dimensions
 
-MAX_IDS = 1_000_000
-from inventory_policy import INSTANCE_POINT_LIMIT as STANDARD_LIMIT, SAMPLE_LIMIT, DBH_BAND_POINT_BUDGET
 
 
 def identity(path):
@@ -40,7 +38,7 @@ def identity(path):
 Node = namedtuple("Node", "offset byte_size point_count")
 
 
-def hierarchy_nodes(reader, bounds, max_pages=1_000_000, max_page_bytes=None):
+def hierarchy_nodes(reader, bounds):
     """Visit flat hierarchy pages without constructing the whole octree.
 
     Each hierarchy entry already includes its voxel key. Page references own
@@ -50,37 +48,26 @@ def hierarchy_nodes(reader, bounds, max_pages=1_000_000, max_page_bytes=None):
     root_bounds = Bounds(reader.copc_info.center - reader.copc_info.halfsize,
                          reader.copc_info.center + reader.copc_info.halfsize)
     pages = [iter(reader.root_page.entries.values())]
-    page_sizes = [reader.copc_info.hierarchy_root_size]
-    retained_page_bytes = page_sizes[0]
-    if max_page_bytes is not None and retained_page_bytes > max_page_bytes:
-        raise ValueError("COPC hierarchy page metadata budget exceeded")
     seen_pages = {reader.copc_info.hierarchy_root_offset}
     while pages:
         entry = next(pages[-1], None)
         if entry is None:
             pages.pop()
-            retained_page_bytes -= page_sizes.pop()
             continue
         if bounds is not None and not entry.key.bounds(root_bounds).overlaps(bounds):
             continue
         if entry.point_count == -1:
             if entry.offset in seen_pages:
                 raise ValueError("Duplicate or cyclic COPC hierarchy page")
-            if entry.byte_size <= 0 or entry.byte_size % 32 or entry.byte_size > 64 * 1024**2:
-                raise ValueError("Invalid or oversized COPC hierarchy page")
-            if len(seen_pages) >= max_pages:
-                raise ValueError("COPC hierarchy page metadata budget exceeded")
+            if entry.byte_size <= 0 or entry.byte_size % 32:
+                raise ValueError("Invalid COPC hierarchy page")
             seen_pages.add(entry.offset)
-            if max_page_bytes is not None and retained_page_bytes + entry.byte_size > max_page_bytes:
-                raise ValueError("COPC hierarchy page metadata budget exceeded")
             reader.source.seek(entry.offset)
             payload = reader.source.read(entry.byte_size)
             if len(payload) != entry.byte_size:
                 raise ValueError("Truncated COPC hierarchy page")
             page = HierarchyPage.from_bytes(payload)
             pages.append(iter(page.entries.values()))
-            page_sizes.append(entry.byte_size)
-            retained_page_bytes += entry.byte_size
         elif entry.point_count > 0:
             yield Node(entry.offset, entry.byte_size, entry.point_count)
         elif entry.point_count < 0:
@@ -107,9 +94,7 @@ def iter_batches(reader, bounds, batch_points, audit):
         return points
 
     for node in hierarchy_nodes(reader, bounds):
-        if node.point_count > limit:
-            raise ValueError(f"COPC node has {node.point_count} points, above batch limit {limit}")
-        if node.byte_size <= 0 or node.byte_size > 256 * 1024**2 or node.offset < 0:
+        if node.byte_size <= 0 or node.offset < 0:
             raise ValueError("Invalid COPC data range")
         if batch and (count + node.point_count > limit or len(batch) >= 4096 or
                       compressed_bytes + node.byte_size > 256 * 1024**2):
@@ -134,8 +119,8 @@ def selected_reader(path, required):
     with laspy.open(path) as reader:
         info = next((vlr for vlr in reader.header.vlrs
                      if vlr.user_id == "copc" and vlr.record_id == 1), None)
-        if info is None or not 0 < info.hierarchy_root_size <= 64 * 1024**2:
-            raise ValueError("Missing COPC info or oversized root hierarchy page")
+        if info is None or info.hierarchy_root_size <= 0:
+            raise ValueError("Missing COPC info")
         selection, groups = decompression_groups(reader.header, required)
     return CopcReader.open(path, decompression_selection=selection), groups
 
@@ -161,8 +146,6 @@ def summarize_batch(states, points, instance, non_tree):
     for i, start in enumerate(starts):
         key = str(int(values[start]))
         if key not in states:
-            if len(states) >= MAX_IDS:
-                raise ValueError("Too many distinct instance IDs for the bounded index")
             states[key] = {"id": int(values[start]), "count": 0,
                            "mins_raw": minima[i].tolist(), "maxs_raw": maxima[i].tolist(),
                            "sum_x_raw": 0, "sum_y_raw": 0}
@@ -174,13 +157,10 @@ def summarize_batch(states, points, instance, non_tree):
         state["maxs_raw"] = [max(a, int(b)) for a, b in zip(state["maxs_raw"], maxima[i])]
 
 
-def plan_windows(instances, origin, size, buffer, retained_limit, band_budget=DBH_BAND_POINT_BUDGET):
+def plan_windows(instances, origin, size, buffer):
+    """One window per core: its halo grown to the full extent of every owned tree."""
     if not math.isfinite(size) or size <= 0 or not math.isfinite(buffer) or buffer < 0:
         raise ValueError("Invalid owned core size or buffer")
-    # A streamed large tree holds its median sample plus its bounded stem band.
-    large_cost = SAMPLE_LIMIT + band_budget
-    if retained_limit < max(STANDARD_LIMIT, large_cost):
-        raise ValueError("Window retention budget must fit one standard and one large instance")
     cores = {}
     for instance in instances:
         core = tuple(math.floor((v - o) / size) for v, o in zip(instance["centroid"], origin))
@@ -188,26 +168,16 @@ def plan_windows(instances, origin, size, buffer, retained_limit, band_budget=DB
         cores.setdefault(core, []).append(instance)
     windows = []
     for core, members in sorted(cores.items()):
-        batches, batch, retained = [], [], 0
-        for member in sorted(members, key=lambda item: item["id"]):
-            cost = member["count"] if member["count"] <= STANDARD_LIMIT else large_cost
-            if batch and retained + cost > retained_limit:
-                batches.append(batch)
-                batch, retained = [], 0
-            batch.append(member)
-            retained += cost
-        if batch:
-            batches.append(batch)
+        members = sorted(members, key=lambda item: item["id"])
         core_min = [o + c * size for o, c in zip(origin, core)]
         halo_min = [v - buffer for v in core_min]
         halo_max = [v + size + buffer for v in core_min]
-        for batch in batches:
-            minimum = [min(halo_min[axis], *(p["mins"][axis] for p in batch)) for axis in (0, 1)]
-            maximum = [max(halo_max[axis], *(p["maxs"][axis] for p in batch)) for axis in (0, 1)]
-            windows.append({"owner_core": list(core), "ids": [p["id"] for p in batch],
-                            "counts": [p["count"] for p in batch],
-                            "mins": minimum, "maxs": maximum,
-                            "expanded": minimum != halo_min or maximum != halo_max})
+        minimum = [min(halo_min[axis], *(p["mins"][axis] for p in members)) for axis in (0, 1)]
+        maximum = [max(halo_max[axis], *(p["maxs"][axis] for p in members)) for axis in (0, 1)]
+        windows.append({"owner_core": list(core), "ids": [p["id"] for p in members],
+                        "counts": [p["count"] for p in members],
+                        "mins": minimum, "maxs": maximum,
+                        "expanded": minimum != halo_min or maximum != halo_max})
     return windows
 
 
@@ -233,8 +203,6 @@ def build_index(config):
                 for layout in layouts:
                     summarize_batch(states[layout["slug"]], points, dimension_names[layout["instance"]],
                                     np.atleast_1d(config["non_tree_ids"]))
-                if sum(map(len, states.values())) > MAX_IDS:
-                    raise ValueError("Too many distinct instance IDs across layouts")
                 print(f"copc_index={audit['decoded_points']}/{header.point_count}", file=sys.stderr, flush=True)
         if audit["decoded_points"] != header.point_count:
             raise ValueError("COPC hierarchy count disagrees with the LAS header")
@@ -250,8 +218,7 @@ def build_index(config):
                 instances.append(state)
             layout["instances"] = sorted(instances, key=lambda item: item["id"])
             layout["windows"] = plan_windows(instances, header.mins[:2], config["core_size"],
-                                                config["buffer"], config["retained_points"],
-                                                config.get("dbh_band_points", DBH_BAND_POINT_BUDGET))
+                                                config["buffer"])
         available = list(header.point_format.dimension_names)
         total = int(header.point_count)
     if identity(path) != source_identity:

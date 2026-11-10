@@ -17,7 +17,7 @@ FIXTURE = ROOT / "tests/tool/fixtures/multi-instance.copc.laz"
 
 def configuration():
     return dict(input=str(FIXTURE), batch_points=25000, core_size=1, buffer=0,
-                retained_points=40000000, non_tree_ids=[0], layouts=[
+                non_tree_ids=[0], layouts=[
                     dict(slug="FM", instance="PredInstance_FM", columns=[
                         "X", "Y", "Z", "PredInstance_FM", "species_id_FM",
                         "species_prob_FM", "PredScore_FM", "PredSemantic_FM"]),
@@ -77,20 +77,19 @@ class OwnedTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "changed since indexing"):
             owned.stream_window(config, index, "FM", 0, BytesIO())
 
-    def test_single_large_node_fails_before_decompression(self):
+    def test_node_larger_than_the_batch_size_is_read_whole(self):
         config = configuration()
         config["batch_points"] = 1
-        with self.assertRaisesRegex(ValueError, "above batch limit"):
-            owned.build_index(config)
+        self.assertEqual(owned.build_index(config)["input_points"], owned.build_index(configuration())["input_points"])
 
-    def test_core_boundary_ownership_and_retention_budget(self):
+    def test_core_boundary_ownership(self):
         instances = [dict(id=i, count=1500000, centroid=[x, 5],
                           mins=[x - 50, 0, 0], maxs=[x + 50, 10, 20])
                      for i, x in enumerate((0, 49, 50, 100), start=1)]
-        windows = owned.plan_windows(instances, [0, 0], 50, 20, 2100000)
+        windows = owned.plan_windows(instances, [0, 0], 50, 20)
         self.assertEqual([item["owner_core"] for item in instances],
                          [[0, 0], [0, 0], [1, 0], [2, 0]])
-        self.assertEqual(len(windows), 4)
+        self.assertEqual([window["ids"] for window in windows], [[1, 2], [3], [4]])
         self.assertEqual(sorted(i for window in windows for i in window["ids"]), [1, 2, 3, 4])
         self.assertTrue(all(window["expanded"] for window in windows))
 

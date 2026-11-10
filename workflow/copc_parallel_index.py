@@ -16,8 +16,6 @@ import lazrs
 import numpy as np
 from stream_inventory_partitions import update_hull, decompression_groups
 
-MAX_NODES = 2_000_000  # compact table plus sort/copy workspace: at most 128 MB
-MAX_HULL_VERTICES = 1_000_000
 MAX_COMPRESSED_BYTES = 64 * 1024**2
 _WORKER = None
 
@@ -26,11 +24,9 @@ def ordered_nodes(reader, audit):
     from copc_owned_inventory import hierarchy_nodes
     data = array('Q')
     source_bytes = os.fstat(reader.source.fileno()).st_size
-    for node in hierarchy_nodes(reader, None, max_pages=100_000, max_page_bytes=8 * 1024**2):
-        if len(data) // 3 >= MAX_NODES:
-            raise ValueError('COPC hierarchy exceeds indexing metadata budget')
-        if node.offset < 0 or not 0 < node.byte_size <= MAX_COMPRESSED_BYTES:
-            raise ValueError('Invalid or oversized COPC data range')
+    for node in hierarchy_nodes(reader, None):
+        if node.offset < 0 or node.byte_size <= 0:
+            raise ValueError('Invalid COPC data range')
         if node.offset + node.byte_size > source_bytes:
             raise ValueError('COPC data range extends beyond source')
         data.extend((node.offset, node.byte_size, node.point_count))
@@ -41,10 +37,7 @@ def ordered_nodes(reader, audit):
     total = sum(map(int, nodes[:, 2]))
     if total != reader.header.point_count:
         raise ValueError('COPC hierarchy count disagrees with the LAS header')
-    audit.update(hierarchy_points=total, node_count=len(nodes),
-                 metadata_table_bytes=nodes.nbytes, max_hierarchy_nodes=MAX_NODES,
-                 flat_metadata_workspace_budget_bytes=64 * MAX_NODES,
-                 max_hierarchy_pages=100_000, max_retained_hierarchy_page_payload_bytes=8 * 1024**2)
+    audit.update(hierarchy_points=total, node_count=len(nodes), metadata_table_bytes=nodes.nbytes)
     return nodes
 
 
@@ -52,10 +45,6 @@ def batches(nodes, point_limit, compressed_limit=MAX_COMPRESSED_BYTES):
     start = count = size = 0
     for i, (_, byte_size, points) in enumerate(nodes):
         points, byte_size = int(points), int(byte_size)
-        if byte_size > compressed_limit:
-            raise ValueError('COPC node exceeds compressed queue budget')
-        if points > point_limit:
-            raise ValueError(f'COPC node has {points} points, above batch limit {point_limit}')
         if i > start and (count + points > point_limit or size + byte_size > compressed_limit or i-start >= 4096):
             yield nodes[start:i], count, size
             start, count, size = i, 0, 0
@@ -96,7 +85,7 @@ def initialize_worker(header, vlr, selection, layouts, non_tree):
 
 
 def summarize_compressed(payload, table, expected):
-    from copc_owned_inventory import summarize_batch, MAX_IDS
+    from copc_owned_inventory import summarize_batch
     header, vlr, selection, layouts, non_tree = _WORKER
     if len(payload) != sum(size for _, size in table) or expected != sum(n for n, _ in table):
         raise ValueError("Incomplete compressed COPC batch")
@@ -110,16 +99,11 @@ def summarize_compressed(payload, table, expected):
     for slug, dimension in layouts:
         states[slug] = {}
         summarize_batch(states[slug], points, dimension, non_tree)
-        if sum(map(len, states.values())) > MAX_IDS:
-            raise ValueError('Too many distinct instance IDs across layouts')
     hull = update_hull(np.empty((0, 2)), np.asarray(points.x), np.asarray(points.y))
-    if len(hull) > MAX_HULL_VERTICES:
-        raise ValueError('Stand hull exceeds indexing metadata budget')
     return states, hull, expected
 
 
 def merge_summaries(target, partial):
-    from copc_owned_inventory import MAX_IDS
     for slug, instances in partial.items():
         for key, incoming in instances.items():
             if key not in target[slug]:
@@ -130,8 +114,6 @@ def merge_summaries(target, partial):
                     state[field] += incoming[field]  # Python integers cannot overflow
                 state['mins_raw'] = list(map(min, zip(state['mins_raw'], incoming['mins_raw'])))
                 state['maxs_raw'] = list(map(max, zip(state['maxs_raw'], incoming['maxs_raw'])))
-        if sum(map(len, target.values())) > MAX_IDS:
-            raise ValueError('Too many distinct instance IDs across layouts')
 
 
 def index_summaries(reader, config, dimension_names):
@@ -163,8 +145,6 @@ def index_summaries(reader, config, dimension_names):
         partial, vertices, count = result
         merge_summaries(states, partial)
         hull = update_hull(hull, vertices[:, 0], vertices[:, 1])
-        if len(hull) > MAX_HULL_VERTICES:
-            raise ValueError('Stand hull exceeds indexing metadata budget')
         audit['decoded_points'] += count
         audit['max_batch_points'] = max(audit['max_batch_points'], count)
         audit['merge_seconds'] += time.monotonic() - started

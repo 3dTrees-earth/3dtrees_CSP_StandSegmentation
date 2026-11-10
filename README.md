@@ -90,7 +90,9 @@ ordinary WKT record, and rejects conflicting valid records. A supplied DTM must
 use the same CRS or an equivalent horizontal CRS and cover the full cloud
 extent. When the GeoTIFF omits a vertical datum, its heights must already use
 the point cloud's vertical datum. The supplied DTM is copied to
-`dtm_full.tif` in the output. With no `--dtm`, the tool generates that file.
+`dtm_full.tif` in the output. With no `--dtm`, the tool generates that file
+(DEFLATE-compressed, no predictor). Both inventory paths look up the terrain
+under each point the same way, in the cell that contains it.
 Missing DTM cells beneath inventoried points stop the run instead of silently
 dismissing those points.
 Fine-tuning controls retain upstream defaults,
@@ -99,47 +101,37 @@ computed only when a non-zero geometry weight requires them.
 
 ### Outputs
 
-**One inventory table in two files, and one stand summary.**
-`inventory.csv` is for people and spreadsheets; `inventory.parquet` is the
-same table for the 3Dtrees viewer. Both have the same rows, columns and order
-(`tests/tool/test_parquet_outputs.R` asserts that the Parquet rows written as
-CSV reproduce the CSV byte for byte).
+**Results:** `inventory.csv` and `inventory.parquet` (the same table, one row
+per tree, with the DBH runs, slices and crown hull embedded as JSON),
+`stand_summary.csv` and the DTM. Run records are written only with
+`--debug-outputs true`.
 
 | File | One row per | Written |
 | --- | --- | --- |
 | `inventory.csv`, `inventory.parquet` | tree and segmentation | always |
 | `stand_summary.csv` | segmentation (instance dimension) | always |
 | `dtm_full.tif`, `dtm_aoi.tif` | DTM (supplied or generated) | always; AOI raster only with `--aoi-json` |
-| `manifest.json` | artifact keys and formats, fields and units, coordinate reference, segmentations, DTM | always |
-| `run_metadata.json`, `resource_summary.json` | run settings, timings and memory | always |
-| `effective_seeds.tsv`, `segmented_csp.laz` | CSP seed / point | only with `--enable-csp true` |
-| `instance_index.json` | instance index | only with the `copc-owned` reader |
+| `segmented_csp.laz` | point (every input dimension plus `PredInstance_CSP`) | only with `--enable-csp true` |
+| `effective_seeds.tsv` | CSP seed | only with `--enable-csp true --debug-outputs true`; the seeds are also in the inventory |
+| `manifest.json` | artifact keys and formats, fields and units, coordinate reference, segmentations, DTM | only with `--debug-outputs true` |
+| `run_metadata.json`, `resource_summary.json` | run settings, timings and memory | only with `--debug-outputs true` |
+| `instance_index.json` | instance index | only with `--debug-outputs true` and the `copc-owned` reader |
 
-**Row order and row groups.** Rows are sorted by `(instance_dimension,
-instance_id)`; strings sort in C (byte) order, so `PredInstance_FM` comes
-before `PredInstance_SAT`. `inventory.parquet` is written in row groups of at
-most 2,048 rows with min/max statistics, snappy-compressed (no zstd). A reader
-fetches one tree by reading only the row group whose
-`instance_dimension`/`instance_id` range covers it, and only the columns it
-needs: the measurement columns for the table, the evidence columns for an
-opened tree. `manifest.json` records `sorted_by` and `row_group_rows`.
+**Row order.** Rows are sorted by `(instance_dimension, instance_id)`; strings
+sort in C (byte) order, so `PredInstance_FM` comes before `PredInstance_SAT`.
+`inventory.parquet` is written in row groups of at most 2,048 rows with min/max
+statistics, snappy-compressed (no zstd), so a reader fetches one tree by reading
+only the row group that covers it, and only the columns it needs.
 
-**Types.** Parquet columns keep the R types (`double`, `int32`, `bool`,
-`string`; `NA` as null). In `inventory.csv` (`data.table::fwrite`, RFC 4180
-quoting), `NA` is an empty field, booleans are `TRUE`/`FALSE` and doubles are
-printed to 15 significant digits; Parquet keeps the full double. The JSON
-evidence cells contain commas and quotes, so read the CSV with a reader that
-follows RFC 4180 quoting (`utils::read.csv`, pandas, Excel, `arrow`).
+**Coordinates.** `x`, `y`, `z`, the slice circles and the crown hulls are in
+the source CRS, named in the `crs` column of `stand_summary.csv` (for example
+`EPSG:2056`); `longitude`/`latitude` are WGS84.
 
-To read a single tree by range in R:
-
-```r
-library(arrow); library(dplyr)
-open_dataset("inventory.parquet") |>
-  filter(instance_dimension == "PredInstance_FM", instance_id == 42) |>
-  select(dbh_m, dbh_fits, dbh_slices, crown_hull) |>
-  collect()
-```
+**Types.** In `inventory.csv` (`data.table::fwrite`, RFC 4180 quoting), `NA` is
+an empty field, booleans are `TRUE`/`FALSE` and doubles are printed to 15
+significant digits. The JSON evidence cells contain commas and quotes, so read
+the CSV with a reader that follows RFC 4180 quoting (`utils::read.csv`, pandas,
+Excel); `data.table::fread` keeps the doubled quotes.
 
 #### Inventory columns (`inventory.csv`, `inventory.parquet`)
 
@@ -150,30 +142,30 @@ Units are also listed per field in `manifest.json`.
 | `segmentation_source` | | Short segmentation name (`SAT`, `FM`, `CSP`, ...): the instance dimension without `PredInstance_` |
 | `instance_dimension` | | LAS dimension holding the tree IDs; the Potree attribute to filter by |
 | `instance_id` | | Tree ID in that dimension |
-| `x`, `y`, `z` | m (source CRS) | Tree position from the DBH measurement; median x/y and lowest z of the tree's points when no DBH was measured |
+| `x`, `y`, `z` | m (source CRS) | Tree position from the DBH measurement; median x/y and lowest z of the tree's grid points when no DBH was measured |
+| `seed_x`, `seed_y`, `seed_height_m` | m (source CRS; height above terrain) | CSP rows only: the seed the tree grew from; the same X, Y and Z a `--seed-file` takes |
 | `longitude`, `latitude` | degree (WGS84) | `x`, `y` transformed to EPSG:4326 |
 | `dbh_m` | m | Diameter at breast height (median of the DBH runs); null when unavailable |
 | `height_m` | m | Tree height above the DTM |
 | `convex_hull_area_m2` | m² | Crown convex-hull area |
-| `point_count` | | Points in the tree |
+| `point_count` | | Input points in the tree (every point, full resolution) |
+| `metrics_point_count` | | Grid points the geometry was measured on (`--metrics-grid`) |
 | `species_id`, `species_prob` | | Modal species ID and median probability of the points with that ID (only with species dimensions) |
 | `species_conflict_fraction` | | Share of the tree's points with another species ID |
 | `scientific_name`, `common_name`, `taxonomy_version`, `model_version` | | From `--species-lookup`, when supplied |
-| `pred_score_fm_values` | | Every distinct `PredScore_FM` of the tree with its point count as JSON (`[{"score":0.83,"point_count":12000}, ...]`, most points first; counted over all points, also for large trees). An instance merged from several FM instances shows each one's score (FM, only with `--inventory-attributes PredScore_FM`) |
+| `pred_score_fm_values` | | Every distinct `PredScore_FM` of the tree with its point count as JSON (`[{"score":0.83,"point_count":12000}, ...]`, most points first; counted over all points). An instance merged from several FM instances shows each one's score (FM, only with `--inventory-attributes PredScore_FM`) |
 | `wood_point_count`, `leaf_point_count`, `wood_share`, `leaf_share` | | From `PredSemantic_FM` (FM, only with `--inventory-attributes PredSemantic_FM`) |
 | `dbh_quality_code`, `dbh_quality_label` | | 1 `too_few_stem_slice_points`, 2 `fallback_circle_estimate`, 3 `rejected_or_unstable_fit`, 4 `spline_fit`, 9 no measurement; the label is `dbh_unavailable` whenever `dbh_m` is null |
 | `dbh_runs`, `dbh_runs_fitted`, `dbh_spread_m` | –, –, m | DBH runs made, runs that produced a DBH, and max − min of their DBH values |
-| `dbh_band_points`, `dbh_band_source_points`, `dbh_band_voxel_m` | –, –, m | Stem-band points used for DBH, available, and the thinning voxel (0 when not thinned) |
-| `inventory_method` | | `standard` or `streaming_large_instance` |
-| `diagnostics` | | What to know before using the tree's values, `code: detail` joined by ` \| `: `streaming_large_instance` (species probability and FM score from a sample of at most 100,000 points) and `dbh_band_thinned` (stem band thinned to fit the DBH budget); empty for most trees |
+| `dbh_band_points` | – | Grid points between `--slice-min` and `--slice-max`, all used for DBH |
 | `dbh_fits` | JSON | Every DBH run: array of `{run, seed, dbh_m, quality_code, reported}`; `reported` is true for the run whose DBH the row reports, `dbh_m` null when the run fitted none |
 | `dbh_slices` | JSON | The stem slices of the reported run: array of `{slice_id, z_lo_m, z_hi_m, ground_z, n_points, n_fit_points, circle_x, circle_y, radius_m, status, spline_x, spline_y, spline_r}` |
-| `crown_hull` | WKT, m (source CRS) | Convex hull polygon of the points above 0.5 m, or of all points when fewer than three are; coordinates to 1 mm; empty for instances with fewer than three points |
+| `crown_hull` | GeoJSON | The crown as a Polygon geometry (`{"type":"Polygon","coordinates":[[[x,y],...]]}`, source CRS, mm): convex hull of the grid points above 0.5 m, or of all points when fewer than three are; empty for trees with fewer than three points |
 
 The table has the union of the per-segmentation columns; a column that a
-segmentation does not produce is empty for its rows. The last four columns are
+segmentation does not produce is empty for its rows. The last three columns are
 the evidence the measurements were computed from; `--dbh-evidence false`
-leaves `dbh_fits`, `dbh_slices` and `crown_hull` empty and changes no value.
+leaves them empty and changes no value.
 
 In `dbh_slices`, `z_lo_m`/`z_hi_m` are above the DTM, `ground_z` and
 `circle_x`/`circle_y` are absolute source-CRS coordinates (m), `n_fit_points`
@@ -194,7 +186,8 @@ One row per segmentation: `segmentation_source`, `instance_dimension`,
 `trees_per_ha` (trees/ha), `basal_area_m2_per_ha` (m²/ha; null unless every
 tree has a DBH), `mean_dbh_m`, `median_dbh_m`, `dbh_p05_m`, `dbh_p25_m`,
 `dbh_p75_m`, `dbh_p95_m`, `mean_height_m`, `median_height_m`, `height_p05_m`,
-`height_p25_m`, `height_p75_m`, `height_p95_m` (m).
+`height_p25_m`, `height_p75_m`, `height_p95_m` (m), and `crs`, the source CRS of
+all coordinates (`EPSG:<code>`, or WKT when the CRS has no EPSG code).
 
 If species predictions are present, `--species-lookup lookup.tsv` can add names
 and taxonomy/model versions. The lookup needs `segmentation_source`,
@@ -228,268 +221,40 @@ Each spatial worker uses one lidR thread, avoiding nested oversubscription. The
 result raster retains the aligned input extent, with unsupported edge areas as
 NoData.
 
-The second pass reads only selected inventory fields into disk-backed hash
-partitions by instance ID. Each tree remains complete even when its points span
-spatial chunks. Inventory samples the DTM in 100,000-point batches, then spools
-normalized points by instance and runs the existing measurements in groups of
-at most two million points. The scanner records the largest instance and the
-tool rejects any instance above two million points before inventory workers
-start; the spatial fallback enforces the same limit while spooling. Group
-geometry is also capped at 500,000 DBH-height points. Group boundaries can
-change the neighbor set used for DBH geometry, so DBH values
-may differ from a whole-partition run when a partition spans multiple groups.
-The scan rejects more than one million distinct instance IDs across layouts
-instead of letting its exact preflight-count map grow without a limit.
-CSP continues to use the full-cloud path to preserve upstream global voxel
-routing and the optional point-cloud output.
+The second pass collects every tree the same way, whatever its size, and
+measures it once it is complete:
 
-For a single merged LAS/LAZ input, COPC or not, `--inventory-read-mode
-sequential` (the `auto` choice for plain LAS/LAZ) uses a bounded Python scan of
-the point stream. It writes spatial buckets and joins them in the same tile
-order as the R reader, preserving the serial inventory output while avoiding
-repeated spatial reads. The `spatial` mode remains available for LAS/LAZ
-directories and comparison runs. Without a WKT CRS record (LAS 1.2 GeoTIFF
-keys), the CRS is read with lidR.
-The sequential scan needs scratch for both bucket and final partition files.
-It maintains exact convex-hull vertices without an XY spool. LAS 1.4 point
-formats 6–10 use selective LAZ decompression for requested standard groups;
-extra-byte dimensions share one compressed group and cannot be selected
-individually. Older formats use the full decompression path.
+- **Points.** `point_count`, the species vote (`species_id`, the median
+  `species_prob` of its points, `species_conflict_fraction`) and the FM fields
+  count every input point.
+- **Geometry.** DBH, height, crown area and position use one point per tree and
+  `--metrics-grid` cell (default 0.01 m, world-aligned, absolute Z). The point
+  kept is the smallest by X, Y, Z, so the result does not depend on file,
+  window or worker order. `metrics_point_count` is the number of grid points;
+  `--metrics-grid 0` measures every point.
+- **DBH.** Upstream `forest_inventory()` runs `--dbh-runs` times (default 5)
+  with seeds derived from the base seed, segmentation and tree ID; the run
+  with the median DBH is reported.
 
-### Complete-instance COPC windows without point partitions
+The readers only decide how a tree's points arrive:
 
-Use `--inventory-read-mode copc-owned` to read COPC nodes in bounded batches
-and send selected points directly to R through a pipe. The first pass records
-all instance counts, global XY centroids and extents. Each ID belongs to one
-non-overlapping core (default 50 m, origin at the input minimum). Its initial
-20 m read buffer expands to include every owned ID's full extent. Both Python
-and R check observed counts against the global index before finalizing a
-window. All COPC hierarchy levels are included, without LOD reduction. Input
-changes, overlapping nodes, oversized decode nodes and incomplete reads fail
-without publishing the staged inventory.
+- `copc-owned` (the `auto` choice for one COPC file) indexes the COPC once
+  (counts, centroids, extents), then reads one window per 50 m core
+  (`--inventory-core-size`): the core plus a 20 m halo (`--inventory-buffer`),
+  grown to the full extent of every tree whose centroid is in the core. One
+  Python reader decodes the window's COPC nodes and pipes each owned tree's
+  points to one of `--inventory-workers` R workers; counts are checked against
+  the index before anything is published. No point files are written.
+- `sequential` (one plain LAS/LAZ) and `spatial` (several files, and with CSP)
+  write the selected columns once to instance partitions (ID modulo the
+  partition count), then collect the trees of each partition in parallel.
 
-```bash
-Rscript exec/run.R --input merged.copc.laz --output-dir inventory \
-  --instance-attribute PredInstance_FM \
-    --species-attribute species_id_FM --species-probability-attribute species_prob_FM \
-  --dtm terrain.tif --inventory-read-mode copc-owned \
-  --inventory-core-size 50 --inventory-buffer 20 \
-  --inventory-batch-points 2000000 --inventory-retained-points 40000000 \
-  --inventory-workers 16 --inventory-decode-threads 4
-```
+There are no point limits or memory guards: memory follows the grid clouds
+of the trees in flight, so enforce a container RAM cap.
 
-Omit `--dtm` to use the existing automatic terrain generation. DTM generation
-precedes the index. The initial 20 m buffer is not a maximum tree radius.
-Owned instances are selected using global centroids, never centroids of clipped
-tiles. Neighbouring points are discarded as each COPC batch is decoded; an
-entire buffered cloud is never materialized. A node batch has at most the
-configured point count and 256 MiB of native point records. A single node above
-that budget is rejected before decompression.
-
-A core may be split into ID batches using the retention budget: small instances
-cost their full count; instances above two million points cost up to 100,000
-sample points. Complete small instances use the existing forest inventory.
-Large instances retain exact all-point counts, extrema, hull and class totals;
-medians use the existing bounded stride sample, and DBH remains unavailable.
-The 500,000-point DBH geometry guard also remains active. Every ID is measured
-once. Within a window, complete IDs are assigned to workers by balancing their
-point counts. One Python COPC reader routes each bounded batch to those workers
-through backpressured kernel pipes. Increasing worker count does not add COPC
-reads. Windows run in sequence, with the configured worker budget available to
-each; even a single dense core can use several R workers. Named FIFO entries are
-removed after each window and never store point payload on disk.
-
-Each instance keeps its source point order and receives an `instance_identity_v1`
-seed derived from the base seed, segmentation dimension and exact instance ID.
-Worker count, window order, core size and retention budget do not change that
-seed. This replaces the earlier window-dependent seed policy; stochastic DBH
-values can change once when upgrading. The partition reader keeps its existing
-seed policy, so its stochastic DBH/positions need not be byte identical. Sampled medians can differ from the partition reader because COPC
-traversal order differs. This mode applies to existing segmentation inventory only.
-
-This path writes no all-point buckets, partitions or per-instance point files.
-It exports `instance_index.json` and per-window completeness audits in
-`run_metadata.json`, alongside the existing table formats and DTM. The index
-can refine resource estimates. Exact hulls and index entries consume additional
-memory, so enforce a container RAM cap even with bounded decode/retention
-budgets. `inventory-workers + inventory-decode-threads` may not exceed 20.
-For example, 16 R workers share four decoder threads. The point retention limit
-applies to the entire window, divided among workers, with additional per-worker
-runtime/geometry overhead. Each worker checks its complete counts; a failed
-consumer or reader aborts the window and prevents publication. Per-window
-metadata records actual worker count, disjoint ID assignments and point counts.
-
-For `copc-owned` parallel inventory, `--inventory-prefetch-mb` bounds the shared
-in-memory delivery queue (default 256 MiB). The reader can decode subsequent
-spatial batches while R workers consume earlier batches. The resource estimator
-includes this queue and can increase it using the complete instance index, up to
-8 GiB and one eighth of the requested RAM cap. It never writes point payloads to
-disk. This overlaps work but cannot guarantee full CPU utilization for spatially
-clustered or uneven instances.
-
-
-The cost is one full index pass plus spatial window rereads. Overlapping windows
-can decode points repeatedly; only owned points are delivered to inventory.
-Metadata records decoded points, including repeats. Benchmark this tradeoff
-against the partition reader for the input's density and ID distribution.
-
-```bash
-python3 workflow/resource_request.py merged.copc.laz --dtm-supplied \
-  --inventory-read-mode copc-owned
-python3 workflow/resource_request.py merged.copc.laz --dtm-supplied \
-  --inventory-read-mode copc-owned --owned-index inventory/instance_index.json
-```
-
-The new resource estimates use buffer sizes and optional instance counts;
-they are provisional until calibrated against full-run cgroup measurements.
-
-A local shared-reader benchmark on a 45.295 GB COPC (4.257 billion points,
-154 complete FM instances) used 16 R workers, four decoder threads and an
-8 GiB queue. Measurement took 1,845.8 s versus 4,367.7 s with one worker (2.37x
-faster); cgroup peak was 21.48 GiB under a 100 GiB cap, average CPU use 4.04
-cores, and no point payload files were written. Adding the separately measured
-1,590.9 s index to the resumed measurement/export process gives 57.33 minutes,
-versus 101.42 minutes for the earlier serial CLI. This is a sum of measured
-phases with a reused verified index, not a fresh end-to-end or cold-cache run.
-The indexed resource estimate requests 32 GB RAM with headroom. Twenty CPUs
-is the tested allowance, not a proven optimum for this large file.
-
-All 154 IDs, 2,546,177,540 assigned points, 23 artifacts, and DTM checks passed.
-Non-DBH inventory metrics matched the earlier serial result. DBH changed with
-the per-instance seed policy: four finite fits versus five, one newly unavailable
-fit, and up to 0.217887 m difference among mutually finite values. This is not a
-claim of DBH equivalence. New serial/parallel fixture and 100 MB runs are byte
-identical across worker counts using the new seed policy.
-
-On the same 100 MB COPC with a verified reused index, single warm-cache runs
-at 2/4/8/12/20 CPU caps took 74.30/47.42/34.58/26.59/24.09 seconds, respectively.
-The corresponding R-worker/decoder pairs were 1/1, 2/2, 4/4, 8/4 and 16/4;
-peak RAM was 1.23/1.92/2.64/4.30/7.11 GiB. All outputs validated and inventories
-were byte-identical. Twelve CPUs was a useful compromise for this small input:
-40% fewer requested CPUs than 20, for 10.4% more elapsed time. This does not
-establish the large-input CPU optimum.
-
-Request resources from the COPC header before submission:
-
-```bash
-python3 workflow/resource_request.py merged.copc.laz --dtm-supplied
-python3 workflow/resource_request.py merged.copc.laz --dtm-supplied --profile throughput
-python3 workflow/resource_request.py merged.copc.laz --dtm-supplied --profile throughput \
-  --partition-dir /path/to/completed/partitions
-```
-
-The JSON returns CPUs, RAM, scratch, spatial chunk width, partition count,
-inventory read mode, and worker count within the requested 20-CPU/100-GB
-limits. The returned `cli_args` array is the executable resource configuration:
-append it to `Rscript exec/run.R` together with your input/output paths,
-segmentation specs, and supplied DTM path (if applicable). Pass it as an argument
-array, not as a shell string. Enforce `cpus` and `memory_gb` in the container or
-scheduler. Other fields are reporting/estimation data: for example, zero
-partitions in COPC mode is a statistic, not a valid `--inventory-partitions`
-argument. The resource-to-CLI integration test parses recommendations for both
-readers, supplied/generated DTM, and multiple CPU caps using the real R parser.
-The default `stable` profile requests one inventory worker. For the partition
-reader this preserves the serial random stream; `copc-owned` uses the same
-per-instance seed policy at every worker count. The opt-in `throughput` profile requests more workers and
-RAM when the COPC point count warrants it. The estimate reads only the header;
-it does not run the inventory or guarantee that a highly skewed tree fits.
-Header-wide density cannot reveal unusually dense local tiles or one giant
-instance; apply the returned hard memory and scratch limits and inspect the
-run metadata. For inputs above the completed end-to-end size, use a bounded
-scan/partition preflight and pass its completed partition directory back with
-`--partition-dir`. New scans save `partition_summary.json` in that directory;
-the estimator uses its largest-instance count to enforce the two-million-point
-limit before recommending workers. An older external audit can be supplied with
-`--instance-preflight AUDIT.json`. Without an instance audit, the estimator
-retains the older partition-size risk screen. Completed partitions also let it
-replace the header-only scratch estimate with actual partition bytes and the
-largest spools that can coexist across active workers. The default single
-inventory worker retains the upstream random stream. `--inventory-workers`
-can parallelize independent partitions, but
-values above one use per-partition seeds; derived DBH measurements can differ
-from a single-worker run even when tree IDs and point counts agree.
-
-On a segmented dataset 2924 COPC, the 1.015 GB inventory completed in
-327.7 seconds at 4 CPUs/16 GiB, versus 209.6 seconds at 8 CPUs/32 GiB and
-185.6 seconds at 20 CPUs/100 GiB. The complete 11.593 GB / 925.7-million-point
-COPC finished in 7,990.6 seconds with 20 CPUs/100 GiB and 512 partitions;
-its cgroup peak was 88.95 GiB with no OOM. These are observed requests, not
-minimum safe resources for other clouds. Larger inputs require an exact
-oversized-instance audit before the resource function can request the bounded
-streaming path.
-An existing 45.3 GB COPC completed the scan/partition stage in 4,279 seconds
-at 1 CPU/16 GiB. Its largest 6.54-GiB partition contains one 109.8-million-
-point instance. The scanner now records every ID above two million points;
-those IDs use bounded streaming summaries rather than a whole-instance LAS.
-Point counts, extrema, species frequencies, FM semantic counts, and convex
-hulls remain exact. X/Y, species probability, and FM score medians use a
-deterministic sample of at most 100,000 points. DBH is marked unavailable for
-these IDs, and the `diagnostics` column of each such tree says so. Standard
-instances whose DBH slice exceeds the geometry cap use the same fallback.
-The stand summary reports DBH coverage and leaves total basal area empty when
-any tree lacks DBH.
-
-The complete 45.295 GB / 4.257-billion-point inventory was then run from its
-audited, completed partitions with a generated 1 m DTM from the same COPC.
-All 154 FM IDs and 2,546,177,540 assigned points were exported as CSV, TSV,
-JSON, and GeoPackage with a validated manifest and DTM. Under a hard 20 CPU /
-24 GB cap, largest-first dynamic partition scheduling took 372.4 seconds for
-inventory and peaked at 13.44 GiB cgroup memory. The same inputs took 503.8
-seconds with fixed scheduling and 438.4 seconds with filename-order dynamic
-scheduling. The inventory CSV was byte-identical across all three runs.
-Twenty CPUs and 24 GB is the measured same-input request; before a full-run
-calibration, the resource estimator requests 20 CPUs and 48 GB from the
-oversized-instance audit. A fresh ordered scan needs about 419 GB scratch by
-the estimator; the completed-partition recovery avoided that rescan. This run
-did not build an image or exercise the future Galaxy wrapper.
-
-COPC DTM candidate generation now reads sequentially because random LAS seeks
-on this valid 4.257-billion-point COPC returned zero-filled records. The 45 GB
-run reused a previously generated, full-extent DTM after checking its CRS,
-coverage, finite cells, and source provenance. Automatic DTM generation in a
-new image still needs its own full CLI run.
-
-A 94.7 MB format-7 COPC scan on 25 September 2026 took 5.44 s
-with selective decompression versus 6.99 s with full decompression; all 60
-instance partitions were byte-identical. On those same partitions and DTM, the
-bounded inventory CSV matched the previous whole-partition inventory byte for
-byte for 172 trees. Its inventory phase took 85.9 s versus 71.0 s, while cgroup
-peak memory fell from 0.89 to 0.72 GiB at one CPU. A 1.015 GB selective scan
-finished in 55.9 s at 0.44 GiB process peak RSS; the earlier scan took 70.6 s.
-A 5.713 GB selective scan finished in 326.1 s at 0.45 GiB process peak RSS;
-the earlier scan took 403.5 s. The scanner emitted no all-point XY spool in
-these runs. The complete 11.593 GB COPC scan finished in 665.9 s at 0.50 GiB
-process peak RSS versus 817.4 s previously. Its largest 2.24-million-point
-partition produced a byte-identical 72-tree inventory with the bounded path;
-cgroup peak fell from 2.84 to 1.44 GiB at one CPU, and wall time rose from
-37.3 to 40.6 s. The new bounded code has not repeated the complete 11.593 GB
-inventory/export phase in a newly built image.
-
-An offline 15,915,252-point merged COPC run exercised two requested instance
-dimensions under a 10-CPU/50-GB Docker limit. With eight 20 m spatial chunks,
-the supplied-DTM run completed in 283.4 seconds and the generated-DTM run in
-461.6 seconds. Both emitted all four formats and exactly the same 96 FM and 98
-FM2 instance IDs and point counts: 11,049,398 and 11,048,497 assigned points,
-respectively. The generated 0.2 m DTM had 49,289 finite cells. Process peak RSS
-was about 1.45 GiB in both runs; the generated-DTM run recorded a conservative
-9.16 GiB sum of worker peak RSS values. The per-instance inventory pass remains
-serial and dominated the measured runtime.
-
-On dataset 2056 (1,141,911,324 points, 3.7 GB compact LAZ), the memory-focused
-streaming candidate stage completed in 56.8 seconds with 10 workers, averaged
-9.51 CPU cores, and retained 1,267,661 candidates. Parent peak RSS was 0.78 GiB
-and the conservative sum of all worker peaks was 6.72 GiB under a 50 GB Docker
-limit. The 300 m + 5 m CSF/TIN stage completed in 76.4 seconds; its conservative
-aggregate worker peak was 2.98 GiB. An earlier exact-coordinate prototype
-scaled from 543.4 seconds with one worker to 306.6 seconds with two, 206.6
-seconds with four, and 127.9 seconds with ten. Replacing per-worker XY grids
-with deterministic cell centres produced the final 56.8-second result and cut
-the conservative 10-worker peak sum from 16.6 GiB to 6.72 GiB.
-
-On the 5.9-million-point GFZ reference, reducing to deterministic 0.1 m cell
-centres before CSF/TIN changed the DTM relative to direct full-cloud CSF/TIN by
-about 9.1 cm RMSE (4.0 cm median absolute difference). Automatic mode therefore
-keeps the direct spatial method for clouds below the 50-million-point threshold.
+CSP segmentation keeps the full-cloud path, because upstream routing needs the
+whole cloud, and then measures every segmentation with the same tree
+collection.
 
 Build and run the container based on Rocker geospatial 4.6.1 with pinned
 current `rlas` and `lidR` source revisions:
@@ -510,8 +275,7 @@ python tests/tool/generate_multi_instance_copc.py \
   inst/extdata/beech.las tests/tool/fixtures/multi-instance.copc.laz
 ```
 
-The container test exercises those three instance dimensions, Parquet alone
-and with every copy format alone and together, generated and
+The container test exercises those three instance dimensions, generated and
 supplied DTMs, and both inventory-only and CSP-enabled execution:
 
 ```bash
@@ -519,39 +283,26 @@ docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
   Rscript tests/tool/test_end_to_end.R
 ```
 
-`tests/tool/test_parquet_outputs.R` writes every table as Parquet and CSV/TSV
-and asserts that they hold the same values, column order and types, that rows
-are sorted by instance in row groups of at most 16,384 rows, and that the crown
-hulls are valid GeoParquet 1.1:
+`tests/tool/test_table_outputs.R` checks the result files on 35,000
+synthetic trees:
 
 ```bash
 docker run --rm -v "$PWD:/work" -w /work 3dtrees-csp \
-  Rscript tests/tool/test_parquet_outputs.R
+  Rscript tests/tool/test_table_outputs.R
 ```
-
-
-
 
 ### Inventory implementation boundaries
 
-- `workflow/inventory_policy.json` is the canonical source of measurement and
-  retention limits for the R consumer, Python planners and resource estimator.
-- `workflow/instance_inventory.R` owns normalization, ordinary measurements,
-  geometry guards, large-instance summaries, and stable instance seeds.
-- `workflow/partition_inventory.R` and `workflow/owned_inventory.R` own their
-  respective point transports and completeness checks.
+- `workflow/instance_inventory.R` owns normalization, the per-tree collection
+  (`new_tree`, `add_tree_points`, `finish_tree`), the metrics grid, the DBH
+  runs and the instance seeds.
+- `workflow/partition_inventory.R` and `workflow/owned_inventory.R` deliver
+  points to the trees and check completeness.
 - `workflow/inventory_readers.R` prepares the selected reader and exposes input
-  statistics, the stand hull and a measurement operation. It owns mode-specific
-  metadata and artifacts; the common runner never examines partition paths.
-- `workflow/inventory_run.R` handles shared DTM preparation, exports and run
-  metadata. `workflow/outputs.R` builds the tables and manifest;
-  `workflow/table_formats.R` owns the table order, Parquet/GeoParquet writing
-  and the optional CSV/TSV/JSON copies. Legacy spatial grids are allocated only by readers or DTM methods
-  that actually need them. A supplied-DTM COPC run does not allocate that grid.
-
-The September 2026 large-file benchmarks above describe the earlier image and
-seed policy. They are retained as historical measurements, not as a rerun of
-this structural refactor.
+  statistics, the stand hull and a measurement operation.
+- `workflow/inventory_run.R` handles DTM preparation, exports and run metadata.
+  `workflow/outputs.R` builds the tables and manifest; `workflow/table_formats.R`
+  writes CSV, Parquet and GeoJSON.
 
 ## Upstream installation history
 The upstream CRAN package was archived in June 2026 with `lidR`. The container

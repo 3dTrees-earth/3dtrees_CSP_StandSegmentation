@@ -128,7 +128,6 @@ def process(config: dict) -> dict:
     layouts = config["layouts"]
     if not layouts:
         raise ValueError("At least one segmentation layout is required")
-    non_tree = np.asarray(config["non_tree_ids"], dtype=np.float64)
     output_dir.mkdir(parents=True)
     bucket_root = output_dir / ".spatial_buckets"
     bucket_root.mkdir()
@@ -198,6 +197,7 @@ def process(config: dict) -> dict:
                     instance = layout["instance"]
                     ids = fields[instance]
                     valid = np.isfinite(ids) & (ids >= 0)
+                    non_tree = np.asarray(layout.get("non_tree_ids", [0]), dtype=np.float64)
                     if non_tree.size:
                         valid &= ~np.isin(ids, non_tree)
                     if not np.any(valid):

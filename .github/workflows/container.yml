@@ -40,6 +40,32 @@ jobs:
           load: ${{ github.event_name == 'pull_request' }}
           tags: ${{ steps.metadata.outputs.tags }}
           labels: ${{ steps.metadata.outputs.labels }}
+      # Singularity image for Galaxy: Galaxy pulls oras://...:<version>-sif, Docker stays for local use.
+      # Release tags only (also a manual run on a tag), so no "main-sif" tags appear.
+      - name: Set up Apptainer
+        if: github.ref_type == 'tag'
+        uses: eWaterCycle/setup-apptainer@v3
+        with:
+          apptainer-version: 1.5.4
+      - name: Build SIF from the pushed digest and push it via ORAS
+        if: github.ref_type == 'tag'
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ACTOR: ${{ github.actor }}
+          IMAGE: ghcr.io/3dtrees-earth/3dtrees_csp_standsegmentation
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "$GHCR_TOKEN" | apptainer registry login -u "$ACTOR" --password-stdin docker://ghcr.io
+          echo "$GHCR_TOKEN" | apptainer registry login -u "$ACTOR" --password-stdin oras://ghcr.io
+          # Built from the digest just pushed, so the Docker image and the SIF hold the same content.
+          apptainer build tool.sif "docker://${IMAGE}@${DIGEST}"
+          apptainer exec --cleanenv --contain tool.sif Rscript /opt/CspStandSegmentation/exec/run.R --version
+          apptainer push tool.sif "oras://${IMAGE}:${VERSION}-sif"
+          apptainer pull --force check.sif "oras://${IMAGE}:${VERSION}-sif"
+          [ "$(sha256sum < tool.sif)" = "$(sha256sum < check.sif)" ]
+          echo "SIF: oras://${IMAGE}:${VERSION}-sif ($(du -h tool.sif | cut -f1), from ${DIGEST})" >> "$GITHUB_STEP_SUMMARY"
       - name: Test PR image
         if: github.event_name == 'pull_request'
         env:

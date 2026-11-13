@@ -22,16 +22,17 @@ expected <- cloud@data[PredInstance_FM > 0, .(point_count = .N), by = PredInstan
 data.table::setorder(expected, PredInstance_FM)
 config <- parse_cli_args(c(base, '--output-dir', file.path(work, 'extra'),
                            '--inventory-read-mode', 'copc-owned',
-                           '--inventory-attributes', 'PredScore_FM,PredSemantic_FM,unused_1,Intensity,ReturnNumber,Synthetic_flag'))
+                           '--inventory-attributes', 'PredSemantic_FM,unused_1,Intensity,ReturnNumber,Synthetic_flag'))
+config$segmentation_specs[[1L]]$score <- 'PredScore_FM'
 selected <- read_point_cloud(input, config$segmentation_specs)
-stopifnot(setequal(names(selected@data), c('X', 'Y', 'Z', 'PredInstance_FM', config$inventory_attributes)),
+stopifnot(setequal(names(selected@data), c('X', 'Y', 'Z', 'PredInstance_FM', 'PredScore_FM', config$inventory_attributes)),
           identical(selected@data$unused_1, cloud@data$unused_1))
 run_tool(config)
 metadata <- jsonlite::fromJSON(file.path(config$output_dir, 'run_metadata.json'))
 stopifnot(setequal(metadata$input_dimensions, names(selected@data)),
           !'Intensity' %in% metadata$input_dimensions_dropped)
 rows <- data.table::as.data.table(utils::read.csv(file.path(config$output_dir, 'inventory.csv')))
-stopifnot(any(!is.na(rows$pred_score_fm_values)), any(is.finite(rows$wood_point_count)))
+stopifnot(any(!is.na(rows$pred_score_values)), !'wood_point_count' %in% names(rows))
 # Missing explicit attributes must fail; do not silently substitute NA.
 missing <- config
 missing$output_dir <- file.path(work, 'missing')
@@ -59,6 +60,6 @@ for (mode in c('copc-owned', 'sequential', 'spatial')) {
   rows <- data.table::as.data.table(utils::read.csv(file.path(config$output_dir, 'inventory.csv')))
   stopifnot(identical(rows$instance_id, expected$PredInstance_FM),
             identical(rows$point_count, expected$point_count),
-            all(is.na(rows$pred_score_fm_values)), all(is.na(rows$wood_point_count)))
+            !'pred_score_values' %in% names(rows))
 }
 cat('Explicit attribute selection integration passed\n')

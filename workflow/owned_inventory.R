@@ -16,12 +16,14 @@ index_owned_inventory <- function(files, specs, config, work_dir) {
   log_path <- file.path(work_dir, "owned_index.log")
   helper <- list(input = files[[1L]], batch_points = config$inventory_batch_points,
                  index_workers = config$inventory_index_workers,
+                 max_window_points = window_point_cap(),
+                 decode_workers = config$inventory_decode_threads,
                  index_queue_mb = config$inventory_index_queue_mb,
                  core_size = config$inventory_core_size, buffer = config$inventory_buffer,
                  prefetch_mb = config$inventory_prefetch_mb,
-                 non_tree_ids = as.list(as.numeric(config$non_tree_ids)),
                  layouts = lapply(names(layouts), function(slug) list(
                    slug = slug, instance = layouts[[slug]]$spec$instance,
+                   non_tree_ids = as.list(as.numeric(layouts[[slug]]$spec$non_tree_ids)),
                    columns = as.list(layouts[[slug]]$columns))))
   jsonlite::write_json(helper, config_path, auto_unbox = TRUE, digits = NA)
   command <- owned_reader_command(config, c("index", "--config", config_path, "--index", index_path))
@@ -52,7 +54,7 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
   ids <- sprintf("%.0f", as.numeric(unlist(plan$ids)))
   expected <- stats::setNames(as.numeric(unlist(plan$counts)), ids)
   observed <- stats::setNames(numeric(length(ids)), ids)
-  trees <- stats::setNames(replicate(length(ids), new_tree(), simplify = FALSE), ids)
+  trees <- stats::setNames(replicate(length(ids), new_tree(tree_frame(config, dtm)), simplify = FALSE), ids)
   if (is.null(audit_path)) audit_path <- file.path(stream$work_dir, sprintf("owned_%s_%06d.json", spec$source, window_index))
   log_path <- paste0(audit_path, ".log")
   command <- owned_reader_command(config, c(
@@ -90,8 +92,9 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
       !identical(as.numeric(unlist(audit$observed_counts))[positions], unname(observed))) {
     abort("Incomplete owned instances; no inventory output published")
   }
-  # Only after both reader and consumer agree may measurements be finalized.
-  results <- lapply(ids, function(key) {
+  # Only after both reader and consumer agree may measurements be finalized;
+  # largest first, so the longest trees start while other workers still run.
+  results <- lapply(ids[order(-expected[ids])], function(key) {
     tree <- trees[[key]]
     trees[[key]] <<- NULL
     finish_tree(tree, as.numeric(key), spec, config, aoi, crs)
@@ -133,6 +136,8 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
   pipe_dir <- tempfile("owned-pipes-", tmpdir = fifo_parent())
   if (!dir.create(pipe_dir)) abort("Cannot create owned worker transport directory")
   on.exit(unlink(pipe_dir, recursive = TRUE), add = TRUE)
+  config$core_tokens <- file.path(pipe_dir, "cores")
+  dir.create(config$core_tokens)
   paths <- file.path(pipe_dir, sprintf("worker-%02d.fifo", seq_along(groups)))
   if (system2("mkfifo", c("-m", "600", vapply(paths, shQuote, character(1)))) != 0L) {
     abort("Cannot create owned worker memory pipes")
@@ -158,9 +163,11 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
       # records and makes terrain/summary updates run on tiny chunks. A raw
       # buffered file connection uses fread to fill readBin's requested batch.
       connection <- file(paths[[i]], open = "rb", raw = TRUE)
-      read_owned_window(stream, layout, groups[[i]], window_index,
-                        terra::rast(dtm_path), config, aoi, crs,
-                        connection = connection, audit_path = audit_path)
+      result <- read_owned_window(stream, layout, groups[[i]], window_index,
+                                  terra::rast(dtm_path), config, aoi, crs,
+                                  connection = connection, audit_path = audit_path)
+      hand_back_core(config$core_tokens)
+      result
     }, mc.set.seed = FALSE)
   }
   command <- owned_reader_command(config, c(
@@ -191,32 +198,113 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
        audit = audit)
 }
 
+# Bytes of memory per owned point held at once (grid trees, batches and
+# measurement, including parallel fits of large trees): 1924, 1927 and 1887
+# peaked at 14-28 GiB per billion points.
+owned_bytes_per_point <- 32
+owned_window_overhead_bytes <- 1024^3
+
+# Memory the job may use: Galaxy's allocation, else 80 % of what is available.
+memory_budget_bytes <- function() {
+  galaxy <- suppressWarnings(as.numeric(Sys.getenv("GALAXY_MEMORY_MB", "")))
+  if (is.finite(galaxy) && galaxy > 0) return(galaxy * 1024^2)
+  info <- tryCatch(readLines("/proc/meminfo"), error = function(error) character())
+  available <- suppressWarnings(as.numeric(sub("^MemAvailable:\\s+([0-9]+) kB$", "\\1",
+                                                grep("^MemAvailable:", info, value = TRUE))))
+  if (length(available) == 1L && is.finite(available)) 0.8 * available * 1024 else Inf
+}
+
+# Owned points one window may hold so that it fits 80 % of the memory budget
+# on its own; larger windows are split into whole-tree windows by the index.
+window_point_cap <- function() {
+  budget <- memory_budget_bytes()
+  if (!is.finite(budget)) return(0)
+  max(1e6, floor((0.8 * budget - owned_window_overhead_bytes) / owned_bytes_per_point))
+}
+
+# Every window of every segmentation, largest first. A window that needs more
+# than half of the memory runs alone with all workers; smaller ones run side
+# by side with two workers each while their estimated memory fits.
+owned_window_tasks <- function(stream, config) {
+  tasks <- list()
+  for (indexed in stream$owned_index$layouts) {
+    for (i in seq_along(indexed$windows)) {
+      points <- sum(as.numeric(unlist(indexed$windows[[i]]$counts)))
+      tasks[[length(tasks) + 1L]] <- list(slug = indexed$slug, index = i, total = length(indexed$windows),
+                                         window = indexed$windows[[i]],
+                                         bytes = points * owned_bytes_per_point + owned_window_overhead_bytes)
+    }
+  }
+  tasks[order(-vapply(tasks, `[[`, numeric(1), "bytes"))]
+}
+
+run_owned_window <- function(task, stream, dtm_path, config, aoi, crs, workers) {
+  lidR::set_lidr_threads(1L)
+  data.table::setDTthreads(1L)
+  config$inventory_workers <- workers
+  config$inventory_decode_threads <- min(config$inventory_decode_threads, max(1L, workers))
+  message(sprintf("CSP workflow: owned %s window %d/%d (%d complete IDs, %d workers)",
+                  task$slug, task$index, task$total, length(task$window$ids), workers))
+  result <- read_parallel_owned_window(stream, stream$layouts[[task$slug]], task$window, task$index,
+                                       dtm_path, config, aoi, crs)
+  gc(FALSE)
+  result
+}
+
 inventory_from_owned_windows <- function(stream, dtm, config, aoi, crs) {
-  inventories <- audits <- list()
   dtm_path <- terra::sources(dtm)
   if (length(dtm_path) != 1L || !file.exists(dtm_path)) abort("Owned inventory requires a file-backed DTM")
-  # One active COPC reader; the worker budget is shared within each window.
+  tasks <- owned_window_tasks(stream, config)
+  budget <- memory_budget_bytes()
+  slots <- config$inventory_workers
+  small_workers <- min(2L, slots)
+  results <- vector("list", length(tasks))
+  running <- list()
+  next_task <- 1L
+  collect <- function(wait) {
+    done <- parallel::mccollect(lapply(running, `[[`, "job"), wait = wait, timeout = if (wait) 0 else 5)
+    for (pid in names(done)) {
+      entry <- Filter(function(item) identical(as.character(item$job$pid), pid), running)[[1L]]
+      if (is.null(done[[pid]]) || inherits(done[[pid]], "try-error")) abort("Owned window worker failed; no inventory published")
+      results[[entry$task]] <<- done[[pid]]
+      running <<- Filter(function(item) !identical(as.character(item$job$pid), pid), running)
+    }
+  }
+  while (next_task <= length(tasks) || length(running)) {
+    used_bytes <- sum(vapply(running, `[[`, numeric(1), "bytes"))
+    used_slots <- sum(vapply(running, `[[`, numeric(1), "workers"))
+    if (next_task <= length(tasks)) {
+      task <- tasks[[next_task]]
+      alone <- task$bytes > budget / 2 || slots <= small_workers
+      workers <- if (alone) slots else small_workers
+      fits <- if (alone) !length(running) else used_slots + workers <= slots && used_bytes + task$bytes <= budget
+      if (fits) {
+        if (alone) {
+          results[[next_task]] <- run_owned_window(task, stream, dtm_path, config, aoi, crs, workers)
+        } else {
+          job <- parallel::mcparallel(run_owned_window(task, stream, dtm_path, config, aoi, crs, workers),
+                                      mc.set.seed = FALSE)
+          running[[length(running) + 1L]] <- list(job = job, task = next_task, bytes = task$bytes, workers = workers)
+        }
+        next_task <- next_task + 1L
+        next
+      }
+    }
+    collect(FALSE)
+  }
+  inventories <- audits <- list()
   for (indexed in stream$owned_index$layouts) {
     slug <- indexed$slug
     layout <- stream$layouts[[slug]]
-    results <- lapply(seq_along(indexed$windows), function(i) {
-      lidR::set_lidr_threads(1L)
-      data.table::setDTthreads(1L)
-      message(sprintf("CSP workflow: owned %s window %d/%d (%d complete IDs, up to %d workers)",
-                       slug, i, length(indexed$windows), length(indexed$windows[[i]]$ids), config$inventory_workers))
-      result <- read_parallel_owned_window(stream, layout, indexed$windows[[i]], i,
-                                           dtm_path, config, aoi, crs)
-      gc(FALSE)
-      result
-    })
-    inventory <- data.table::rbindlist(lapply(results, `[[`, "inventory"), use.names = TRUE, fill = TRUE)
+    mine <- results[vapply(tasks, function(task) identical(task$slug, slug), logical(1))]
+    inventory <- data.table::rbindlist(lapply(mine, `[[`, "inventory"), use.names = TRUE, fill = TRUE)
     if (anyDuplicated(inventory$instance_id)) abort("An owned instance was measured more than once")
     if (is.null(aoi) && nrow(inventory) != length(indexed$instances)) abort("Missing complete instance outputs")
     data.table::setorder(inventory, instance_id)
     attr(inventory, "segmentation_source") <- layout$spec$source
     attr(inventory, "instance_dimension") <- layout$spec$instance
     inventories[[slug]] <- inventory
-    audits[[slug]] <- lapply(results, `[[`, "audit")
+    audits[[slug]] <- lapply(mine, `[[`, "audit")
   }
   attr(inventories, "copc_audits") <- audits
   inventories

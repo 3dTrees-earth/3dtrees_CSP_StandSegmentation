@@ -40,6 +40,7 @@ specifications <- c(
   "--instance-attribute", "PredInstance_SAT",
   "--instance-attribute", "PredInstance_FM",
   "--species-attribute", "species_id_FM", "--species-probability-attribute", "species_prob_FM",
+  "--score-attribute", "PredScore_FM",
   "--instance-attribute", "PredInstance_ULS"
 )
 dimensions <- c(SAT = "PredInstance_SAT", FM = "PredInstance_FM", ULS = "PredInstance_ULS")
@@ -57,7 +58,6 @@ run_case <- function(label, mode, csp = FALSE, chunk_size = 300,
   args <- c(runner, "--input", source, "--output-dir", output,
             specifications,
             "--species-lookup", lookup_path,
-            "--inventory-attributes", "PredScore_FM,PredSemantic_FM",
             "--read-chunk-size", as.character(chunk_size),
             if (!is.null(inventory_read_mode)) c("--inventory-read-mode", inventory_read_mode),
             "--dtm-workers", "1", "--debug-outputs", "true")

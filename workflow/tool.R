@@ -15,6 +15,17 @@ inventory_canonical_names <- function(names) {
   names
 }
 
+# The input's LAS scale and offset when every file shares them, else NULL
+# (grid points are then kept as doubles).
+coordinate_frame <- function(files) {
+  frames <- lapply(files, function(file) {
+    header <- lidR::readLASheader(file)@PHB
+    list(scale = c(X = header[["X scale factor"]], Y = header[["Y scale factor"]], Z = header[["Z scale factor"]]),
+         offset = c(X = header[["X offset"]], Y = header[["Y offset"]], Z = header[["Z offset"]]))
+  })
+  if (all(vapply(frames, identical, logical(1), frames[[1L]]))) frames[[1L]] else NULL
+}
+
 resolve_input_files <- function(path) {
   if (file.exists(path) && !dir.exists(path)) return(normalizePath(path, mustWork = TRUE))
   if (!dir.exists(path)) abort(sprintf("Input does not exist: %s", path))
@@ -24,7 +35,7 @@ resolve_input_files <- function(path) {
 }
 
 inventory_spec_dimensions <- function(spec) {
-  unique(c(spec$instance, spec$species, spec$species_prob, spec$attributes))
+  unique(c(spec$instance, spec$species, spec$species_prob, spec$score, spec$attributes))
 }
 
 inventory_read_dimensions <- function(specs) {
@@ -359,8 +370,30 @@ run_csp <- function(las, config, stage_dir) {
   )
 }
 
+# A 3D projected CRS (e.g. "Promoted to 3D from EPSG:32616") as its 2D
+# version: GeoTIFF keys hold only horizontal CRSs, and GDAL would otherwise
+# write the CRS to a .aux.xml side file and a wrong one into the GeoTIFF.
+horizontal_wkt <- function(wkt) {
+  if (!grepl("CS\\[Cartesian,\\s*3\\]", wkt)) return(wkt)
+  chars <- strsplit(wkt, "", fixed = TRUE)[[1L]]
+  for (start in rev(as.integer(gregexpr("AXIS[", wkt, fixed = TRUE)[[1L]]))) {
+    depth <- 0L
+    for (end in (start + 4L):length(chars)) {
+      depth <- depth + (chars[[end]] == "[") - (chars[[end]] == "]")
+      if (depth == 0L) break
+    }
+    axis <- substr(wkt, start, end)
+    if (grepl("ORDER[3]", axis, fixed = TRUE)) {
+      wkt <- paste0(sub(",\\s*$", "", substr(wkt, 1L, start - 1L)), substr(wkt, end + 1L, nchar(wkt)))
+      break
+    }
+  }
+  sub("CS\\[Cartesian,\\s*3\\]", "CS[Cartesian,2]", wkt)
+}
+
 # DEFLATE without predictor: lossless and readable by every TIFF reader.
 write_geotiff <- function(raster, path) {
+  terra::crs(raster) <- horizontal_wkt(terra::crs(raster))
   terra::writeRaster(raster, path, overwrite = TRUE, gdal = "COMPRESS=DEFLATE")
 }
 
@@ -511,7 +544,7 @@ parallel_chunk_map <- function(values, workers, fun) {
   results
 }
 
-chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir, workers = 1L) {
+chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir, workers = 1L, crs = NULL) {
   partial_dir <- file.path(work_dir, "dtm")
   dir.create(partial_dir, recursive = TRUE)
   bounds <- point_cloud_bounds(files)
@@ -552,6 +585,9 @@ chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir, 
     ceiling(bounds$ymax / resolution) * resolution
   )
   dtm <- terra::extend(dtm, target)
+  # The DTM is in the point cloud's CRS, also when the ground candidates (or
+  # lidR) could not carry it, as for a 3D projected WKT.
+  if (!is.null(crs)) terra::crs(dtm) <- crs$wkt
   output <- file.path(stage_dir, "dtm_full.tif")
   write_geotiff(dtm, output)
   list(
@@ -617,7 +653,7 @@ make_inventory_dtm <- function(files, bounds, config, work_dir, stage_dir) {
   if (identical(strategy, "spatial")) {
     result <- chunked_dtm(
       files, spatial_chunks(bounds, config$read_chunk_size), config$chunk_buffer, config$dtm_resolution,
-      work_dir, stage_dir, config$dtm_workers
+      work_dir, stage_dir, config$dtm_workers, bounds$crs
     )
     result$strategy <- "spatial"
     result$candidate_metadata <- NULL
@@ -629,7 +665,7 @@ make_inventory_dtm <- function(files, bounds, config, work_dir, stage_dir) {
   candidate_chunks <- spatial_chunks(candidate_bounds, config$read_chunk_size)
   result <- chunked_dtm(
     candidates$path, candidate_chunks, config$chunk_buffer,
-    config$dtm_resolution, work_dir, stage_dir, config$dtm_workers
+    config$dtm_resolution, work_dir, stage_dir, config$dtm_workers, bounds$crs
   )
   result$method <- paste0("streaming_candidates_", result$method)
   result$strategy <- "streaming"
@@ -639,10 +675,13 @@ make_inventory_dtm <- function(files, bounds, config, work_dir, stage_dir) {
 
 run_tool <- function(config) {
   started <- Sys.time()
+  # No .aux.xml side files next to the published rasters.
+  terra::setGDALconfig("GDAL_PAM_ENABLED", "NO")
   set.seed(config$random_seed)
   lidR::set_lidr_threads(config$geometry_threads)
   files <- resolve_input_files(config$input)
   config <- resolve_inventory_read_mode(config, files)
+  config$coordinate_frame <- coordinate_frame(files)
   output_parent <- dirname(config$output_dir)
   dir.create(output_parent, recursive = TRUE, showWarnings = FALSE)
   stage_dir <- tempfile("csp-stage-", tmpdir = output_parent)
@@ -716,13 +755,13 @@ run_tool <- function(config) {
     write_csp_cloud(files, source_crs, csp$ids, file.path(stage_dir, "segmented_csp.laz"))
     inventory_las <- normalized
     inventory_las <- lidR::add_lasattribute(inventory_las, csp$ids, "PredInstance_CSP", "CSP tree instance ID")
-    specs <- c(specs, list(list(instance = "PredInstance_CSP", source = "CSP", species = NULL, species_prob = NULL)))
+    specs <- c(specs, list(list(instance = "PredInstance_CSP", source = "CSP", species = NULL, species_prob = NULL, non_tree_ids = 0)))
   }
 
   validate_specs(inventory_las, specs)
   inventories <- list()
   for (spec in specs) {
-    result <- inventory_from_points(inventory_las@data, spec, config, aoi, las_crs)
+    result <- inventory_from_points(inventory_las@data, spec, config, aoi, las_crs, dtm_result$dtm)
     slug <- gsub("[^A-Za-z0-9_]+", "_", spec$source)
     inventories[[slug]] <- result
   }

@@ -27,9 +27,9 @@ read_inventory <- function(path, slug, evidence = TRUE) {
 }
 config <- parse_cli_args(c("--input", input, "--output-dir", file.path(work, "owned"), "--debug-outputs", "true",
                           "--instance-attribute", "PredInstance_FM", "--species-attribute", "species_id_FM", "--species-probability-attribute", "species_prob_FM",
+                          "--score-attribute", "PredScore_FM",
                           "--instance-attribute", "PredInstance_SAT", "--species-attribute", "species_id_FM", "--species-probability-attribute", "species_prob_FM",
                           "--instance-attribute", "PredInstance_ULS", "--dtm", dtm_path,
-                          "--inventory-attributes", "PredScore_FM,PredSemantic_FM",
                           "--inventory-read-mode", "copc-owned", "--inventory-core-size", "1",
                           "--inventory-buffer", "0", "--inventory-batch-points", "25000",
                           "--inventory-workers", "2", "--inventory-decode-threads", "1"))
@@ -69,7 +69,7 @@ baseline_config$inventory_workers <- 1L
 run_tool(baseline_config)
 for (spec in config$segmentation_specs) {
   columns <- c("instance_id", "point_count", "height_m", "convex_hull_area_m2")
-  if (spec$source == "FM") columns <- c(columns, "species_id", "species_prob", "wood_point_count", "leaf_point_count")
+  if (spec$source == "FM") columns <- c(columns, "species_id", "species_prob", "pred_score_values")
   read <- function(path) read_inventory(path, spec$source)[, ..columns]
   stopifnot(isTRUE(all.equal(read(config$output_dir), read(baseline_config$output_dir),
                             tolerance = 1e-7, check.attributes = FALSE)))

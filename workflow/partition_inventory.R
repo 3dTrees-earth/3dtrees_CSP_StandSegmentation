@@ -49,7 +49,7 @@ stream_inventory_partitions <- function(files, chunks, specs, config, work_dir, 
       layout_columns <- layout$columns
       selected <- points[
         !is.na(get(instance)) & is.finite(get(instance)) &
-          get(instance) >= 0 & !(get(instance) %in% config$non_tree_ids),
+          get(instance) >= 0 & !(get(instance) %in% spec$non_tree_ids),
         ..layout_columns
       ]
       if (!nrow(selected)) next
@@ -93,7 +93,7 @@ stream_inventory_partitions_python <- function(files, chunks, specs, config, wor
   helper_config <- list(
     input = files[[1L]], output_dir = file.path(work_dir, "partitions"),
     hull_path = hull_path, partitions = config$inventory_partitions,
-    chunk_points = 1000000L, non_tree_ids = as.numeric(config$non_tree_ids),
+    chunk_points = 1000000L,
     spatial_grid = list(
       xmin = min(vapply(chunks, `[[`, numeric(1), "xmin")),
       ymin = min(vapply(chunks, `[[`, numeric(1), "ymin")),
@@ -103,6 +103,7 @@ stream_inventory_partitions_python <- function(files, chunks, specs, config, wor
     ),
     layouts = lapply(names(layouts), function(slug) list(
       slug = slug, instance = layouts[[slug]]$spec$instance,
+      non_tree_ids = as.list(as.numeric(layouts[[slug]]$spec$non_tree_ids)),
       columns = layouts[[slug]]$columns
     ))
   )
@@ -158,10 +159,10 @@ collect_partition_trees <- function(path, columns, dtm, spec, config,
                                                dimnames = list(NULL, columns)))
     points <- normalize_inventory_points(points, dtm)
     points <- points[is.finite(Z) & is.finite(get(instance)) & get(instance) >= 0 &
-                       !(get(instance) %in% config$non_tree_ids)]
+                       !(get(instance) %in% spec$non_tree_ids)]
     for (id in unique(points[[instance]])) {
       key <- sprintf("%.0f", id)
-      tree <- if (is.null(trees[[key]])) new_tree() else trees[[key]]
+      tree <- if (is.null(trees[[key]])) new_tree(tree_frame(config, dtm)) else trees[[key]]
       trees[[key]] <- add_tree_points(tree, points[get(instance) == id], spec, config)
     }
   }

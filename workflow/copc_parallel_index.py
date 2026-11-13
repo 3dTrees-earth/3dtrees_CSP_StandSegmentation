@@ -79,14 +79,14 @@ def read_batch(source, nodes, size):
     return payload, table
 
 
-def initialize_worker(header, vlr, selection, layouts, non_tree):
+def initialize_worker(header, vlr, selection, layouts):
     global _WORKER
-    _WORKER = header, vlr, selection.to_lazrs(), layouts, non_tree
+    _WORKER = header, vlr, selection.to_lazrs(), layouts
 
 
 def summarize_compressed(payload, table, expected):
     from copc_owned_inventory import summarize_batch
-    header, vlr, selection, layouts, non_tree = _WORKER
+    header, vlr, selection, layouts = _WORKER
     if len(payload) != sum(size for _, size in table) or expected != sum(n for n, _ in table):
         raise ValueError("Incomplete compressed COPC batch")
     decoded = np.zeros(expected * header.point_format.size, dtype=np.uint8)
@@ -96,7 +96,7 @@ def summarize_compressed(payload, table, expected):
     if len(points) != expected:
         raise ValueError('COPC node decompression returned an incomplete batch')
     states = {}
-    for slug, dimension in layouts:
+    for slug, dimension, non_tree in layouts:
         states[slug] = {}
         summarize_batch(states[slug], points, dimension, non_tree)
     hull = update_hull(np.empty((0, 2)), np.asarray(points.x), np.asarray(points.y))
@@ -133,11 +133,12 @@ def index_summaries(reader, config, dimension_names):
                  compressed_bytes=0, native_threads_per_worker=1)
     nodes = ordered_nodes(reader, audit)
     limit = min(config['batch_points'], max(1, 256 * 1024**2 // reader.header.point_format.size))
-    layouts = [(x['slug'], dimension_names[x['instance']]) for x in config['layouts']]
+    layouts = [(x['slug'], dimension_names[x['instance']], np.atleast_1d(x.get('non_tree_ids', [0])))
+               for x in config['layouts']]
     initialization = (reader.header, reader.laszip_vlr.record_data,
-                      decompression_groups(reader.header, {"X", "Y", "Z"} | {name for _, name in layouts})[0],
-                      layouts, np.atleast_1d(config['non_tree_ids']))
-    states = {slug: {} for slug, _ in layouts}
+                      decompression_groups(reader.header, {"X", "Y", "Z"} | {name for _, name, _ in layouts})[0],
+                      layouts)
+    states = {slug: {} for slug, _, _ in layouts}
     hull = np.empty((0, 2))
     def merge(result):
         nonlocal hull

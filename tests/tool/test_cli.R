@@ -11,7 +11,7 @@ expect_error <- function(expression, pattern) {
   stopifnot(!is.null(message), grepl(pattern, message))
 }
 
-spec <- segmentation_spec("PredInstance_FM", "species_id_FM", "species_prob_FM")
+spec <- segmentation_spec("PredInstance_FM", "species_id_FM", "species_prob_FM", "PredScore_FM")
 stopifnot(
   identical(spec$source, "FM"),
   identical(spec$species, "species_id_FM"),
@@ -19,6 +19,14 @@ stopifnot(
 )
 expect_error(segmentation_spec("PredInstance_FM", "species_id_FM"), "supplied together")
 expect_error(segmentation_spec("bad-name"), "valid LAS dimension")
+# Score and non-tree IDs belong to the --instance-attribute before them.
+own <- parse_cli_args(c("--input", "input.laz", "--output-dir", "output",
+                        "--instance-attribute", "PredInstance_SAT", "--non-tree-ids", "0,-1",
+                        "--instance-attribute", "PredInstance_FM", "--score-attribute", "PredScore_FM"))$segmentation_specs
+stopifnot(identical(own[[1L]]$non_tree_ids, c(0, -1)), is.null(own[[1L]]$score),
+          identical(own[[2L]]$non_tree_ids, 0), identical(own[[2L]]$score, "PredScore_FM"))
+expect_error(parse_cli_args(c("--input", "input.laz", "--output-dir", "output", "--non-tree-ids", "0",
+                              "--instance-attribute", "PredInstance_SAT")), "must follow an --instance-attribute")
 # Species options belong to the --instance-attribute before them.
 paired <- parse_cli_args(c("--input", "input.laz", "--output-dir", "output",
                            "--instance-attribute", "PredInstance_RCT",
@@ -38,7 +46,8 @@ config <- parse_cli_args(c(
   "--output-dir", "output",
   "--instance-attribute", "PredInstance_SAT",
   "--instance-attribute", "PredInstance_FM", "--species-attribute", "species_id_FM", "--species-probability-attribute", "species_prob_FM",
-  "--inventory-attributes", "PredScore_FM,PredSemantic_FM",
+  "--score-attribute", "PredScore_FM", "--non-tree-ids", "0,9",
+  "--inventory-attributes", "PredSemantic_FM",
   "--dtm-resolution", "0.2",
   "--routing-workers", "1"
 ))
@@ -161,19 +170,15 @@ points <- data.table::data.table(
   PredInstance_FM = c(1, 1, 1, 2),
   species_id_FM = c(4, 4, 7, -1),
   species_prob_FM = c(0.8, 0.6, 0.9, -1),
-  PredScore_FM = c(0.9, 0.9, 0.2, -1),
-  PredSemantic_FM = c(1, 2, 2, 0)
+  PredScore_FM = c(0.9, 0.9, 0.2, -1)
 )
 points[, `:=`(X = 0, Y = 0, Z = 0)]
 collect <- function(id) add_tree_points(new_tree(), points[PredInstance_FM == id], spec, list(metrics_grid = 0))
 species <- species_vote(collect(1))
 stopifnot(species[[1L]] == 4, species[[2L]] == 0.7, abs(species[[3L]] - 1 / 3) < 1e-12)
-fm <- fm_fields(collect(1))
 stopifnot(
-  identical(fm[[1L]], '[{"score":0.9,"point_count":2},{"score":0.2,"point_count":1}]'),
-  is.na(fm_fields(collect(2))[[1L]]),
-  fm[[2L]] == 1, fm[[3L]] == 2,
-  abs(fm[[4L]] - 1 / 3) < 1e-12, abs(fm[[5L]] - 2 / 3) < 1e-12
+  identical(tree_scores(collect(1)), '[{"score":0.9,"point_count":2},{"score":0.2,"point_count":1}]'),
+  is.na(tree_scores(collect(2)))
 )
 
 header <- lidR::readLASheader(file.path(root, "tests", "tool", "fixtures", "multi-instance.copc.laz"))
@@ -275,3 +280,16 @@ edge <- suppressMessages(lidR::LAS(edge))
 stopifnot(sprintf("%.6f", min(edge@data$X)) == "4021833.400000",
           nrow(CspStandSegmentation::add_geometry(edge, n_cores = 1)@data) == 500L)
 cat("spatial index bounds test passed\n")
+# A 3D projected CRS (as written by some production COPCs) is demoted to 2D
+# before a DTM is written, so the GeoTIFF carries the right projected CRS.
+crs_3d <- "PROJCRS[\"WGS84 / UTM zone 16N\",BASEGEOGCRS[\"WGS84 / UTM zone 16N\",DATUM[\"WGS84\",ELLIPSOID[\"WGS84\",6378137,298.257223563,LENGTHUNIT[\"metre\",1]],ID[\"EPSG\",6326]],PRIMEM[\"Greenwich\",0,ANGLEUNIT[\"Degree\",0.0174532925199433],ID[\"EPSG\",8901]]],CONVERSION[\"UTM zone 16N\",METHOD[\"Transverse Mercator\",ID[\"EPSG\",9807]],PARAMETER[\"Latitude of natural origin\",0,ANGLEUNIT[\"Degree\",0.0174532925199433],ID[\"EPSG\",8801]],PARAMETER[\"Longitude of natural origin\",-87,ANGLEUNIT[\"Degree\",0.0174532925199433],ID[\"EPSG\",8802]],PARAMETER[\"Scale factor at natural origin\",0.9996,SCALEUNIT[\"unity\",1],ID[\"EPSG\",8805]],PARAMETER[\"False easting\",500000,LENGTHUNIT[\"Meter\",1],ID[\"EPSG\",8806]],PARAMETER[\"False northing\",0,LENGTHUNIT[\"Meter\",1],ID[\"EPSG\",8807]],ID[\"EPSG\",16016]],CS[Cartesian,3],AXIS[\"easting\",east,ORDER[1],LENGTHUNIT[\"Meter\",1,ID[\"EPSG\",9001]]],AXIS[\"northing\",north,ORDER[2],LENGTHUNIT[\"Meter\",1,ID[\"EPSG\",9001]]],AXIS[\"ellipsoidal height (h)\",up,ORDER[3],LENGTHUNIT[\"Meter\",1,ID[\"EPSG\",9001]]],REMARK[\"Promoted to 3D from EPSG:32616\"]]"
+stopifnot(grepl("CS[Cartesian,2]", horizontal_wkt(crs_3d), fixed = TRUE),
+          !grepl("ellipsoidal height", horizontal_wkt(crs_3d), fixed = TRUE))
+terra::setGDALconfig("GDAL_PAM_ENABLED", "NO")
+dtm_3d <- terra::rast(xmin = 300000, xmax = 300010, ymin = 1700000, ymax = 1700010, resolution = 1, crs = crs_3d)
+terra::values(dtm_3d) <- 1
+dtm_path <- tempfile(fileext = ".tif")
+write_geotiff(dtm_3d, dtm_path)
+stopifnot(identical(sf::st_crs(terra::crs(terra::rast(dtm_path)))$epsg, 32616L), !file.exists(paste0(dtm_path, ".aux.xml")))
+cat("3D CRS DTM test passed\n")
+

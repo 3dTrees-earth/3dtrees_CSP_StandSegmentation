@@ -57,6 +57,37 @@ class OwnedTests(unittest.TestCase):
             np.testing.assert_array_equal(ordered(actual), ordered(expected))
             self.assertEqual(sum(item["count"] for item in layout["instances"]), int(valid.sum()))
 
+    def test_decoder_pool_returns_the_same_rows(self):
+        config = configuration()
+        index = owned.build_index(config)
+        pooled = dict(config, decode_workers=2)
+        for layout in index["layouts"]:
+            for number, _ in enumerate(layout["windows"]):
+                single, parallel = BytesIO(), BytesIO()
+                owned.stream_window(config, index, layout["slug"], number, single)
+                audit = owned.stream_window(pooled, index, layout["slug"], number, parallel)
+                self.assertEqual(audit["decode_workers"], 2)
+                self.assertEqual(audit["expected_counts"], audit["observed_counts"])
+                width = len(layout["columns"])
+                rows = [np.frombuffer(out.getvalue(), dtype="<f8").reshape(-1, width) for out in (single, parallel)]
+                rows = [r[np.lexsort(r.T)] for r in rows]
+                np.testing.assert_array_equal(rows[0], rows[1])
+
+    def test_oversized_core_splits_into_whole_tree_windows(self):
+        instances = [dict(id=i, count=c, centroid=[x, 5.0], mins=[x - 1, 4.0, 0.0], maxs=[x + 1, 6.0, 9.0])
+                     for i, (c, x) in enumerate([(40, 1.0), (30, 3.0), (30, 5.0), (90, 7.0), (10, 9.0)], start=1)]
+        windows = owned.plan_windows(instances, [0, 0], 50, 20, max_points=60)
+        ids = [i for window in windows for i in window["ids"]]
+        self.assertEqual(sorted(ids), [1, 2, 3, 4, 5])
+        for window in windows:
+            if len(window["ids"]) > 1:
+                self.assertLessEqual(sum(window["counts"]), 60)
+            members = [p for p in instances if p["id"] in window["ids"]]
+            self.assertLessEqual(window["mins"][0], min(p["mins"][0] for p in members))
+            self.assertGreaterEqual(window["maxs"][0], max(p["maxs"][0] for p in members))
+        self.assertIn([4], [window["ids"] for window in windows])  # one tree larger than the cap stays alone
+        self.assertEqual(len(owned.plan_windows(instances, [0, 0], 50, 20)), 1)
+
     def test_missing_nodes_fail_completeness(self):
         config = configuration()
         config["core_size"] = 50

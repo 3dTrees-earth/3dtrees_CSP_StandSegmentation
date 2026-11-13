@@ -52,13 +52,15 @@ RUN install2.r --error --skipinstalled --ncpus -1 \
 
 COPY patches/rlas-read-all-extrabytes.patch /tmp/rlas-read-all-extrabytes.patch
 COPY patches/rlas-quiet-progress.patch /tmp/rlas-quiet-progress.patch
+COPY patches/rlas-64bit-point-count.patch /tmp/rlas-64bit-point-count.patch
 RUN curl -L -sS "https://github.com/r-lidar/rlas/archive/${RLAS_COMMIT}.tar.gz" -o /tmp/rlas.tar.gz \
     && mkdir -p /tmp/rlas-src \
     && tar -xzf /tmp/rlas.tar.gz -C /tmp/rlas-src --strip-components=1 \
     && patch -d /tmp/rlas-src -p1 < /tmp/rlas-read-all-extrabytes.patch \
     && patch -d /tmp/rlas-src -p1 < /tmp/rlas-quiet-progress.patch \
+    && patch -d /tmp/rlas-src -p1 < /tmp/rlas-64bit-point-count.patch \
     && R CMD INSTALL /tmp/rlas-src \
-    && rm -rf /tmp/rlas-src /tmp/rlas.tar.gz /tmp/rlas-read-all-extrabytes.patch /tmp/rlas-quiet-progress.patch
+    && rm -rf /tmp/rlas-src /tmp/rlas.tar.gz /tmp/rlas-read-all-extrabytes.patch /tmp/rlas-quiet-progress.patch /tmp/rlas-64bit-point-count.patch
 
 COPY patches/lidR-grid-bounds.patch /tmp/lidR-grid-bounds.patch
 RUN curl -L -sS "https://github.com/r-lidar/lidR/archive/${LIDR_COMMIT}.tar.gz" -o /tmp/lidR.tar.gz \

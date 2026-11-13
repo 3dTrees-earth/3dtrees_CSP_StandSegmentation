@@ -24,19 +24,28 @@ partition <- file.path(work, "partition.bin")
 append_partition(partition, points)
 sat_spec <- list(source = "SAT", instance = "PredInstance_SAT")
 trees <- collect_partition_trees(partition, columns, dtm, sat_spec, test_config, batch_points = 1L)
+grid_1 <- tree_grid(trees[["1"]], 0)
 stopifnot(identical(sort(names(trees)), c("1", "2")),
-          trees[["1"]]$count == 2, identical(trees[["1"]]$grid$Z, c(1, 2)),
-          identical(trees[["1"]]$grid$Zref, c(3, 4)), identical(trees[["2"]]$grid$X, c(2, 4)))
+          trees[["1"]]$count == 2, identical(grid_1$Z, c(1, 2)),
+          identical(grid_1$Zref, c(3, 4)), identical(tree_grid(trees[["2"]], 0)$X, c(2, 4)))
+# With the input's scale and offset the grid is stored as LAS integers and
+# decodes to the same coordinates and heights.
+framed <- collect_partition_trees(partition, columns, dtm, sat_spec,
+                                  c(test_config, list(coordinate_frame = list(
+                                    scale = c(X = 0.001, Y = 0.001, Z = 0.001), offset = c(X = 0, Y = 0, Z = 0)))),
+                                  batch_points = 1L)
+stopifnot(is.integer(framed[["1"]]$chunks[[1L]]$X),
+          identical(tree_grid(framed[["1"]], 0)[, .(X, Y, Z, Zref)], grid_1[, .(X, Y, Z, Zref)]))
 
-fm_spec <- list(source = "FM", instance = "PredInstance_FM",
-                species = "species_id_FM", species_prob = "species_prob_FM")
+fm_spec <- list(source = "FM", instance = "PredInstance_FM", species = "species_id_FM",
+                species_prob = "species_prob_FM", score = "PredScore_FM", non_tree_ids = 0)
 fm_columns <- c("X", "Y", "Z", "PredInstance_FM", "species_id_FM",
-                "species_prob_FM", "PredScore_FM", "PredSemantic_FM")
+                "species_prob_FM", "PredScore_FM")
 fm_points <- data.table::data.table(
   X = c(1, 2, 3, 4), Y = c(1, 2, 3, 4), Z = c(3, 5, 4, 6),
   PredInstance_FM = c(1, 2, 1, 2), species_id_FM = c(7, 8, 7, 8),
   species_prob_FM = c(0.8, 0.7, 0.9, 0.6),
-  PredScore_FM = c(0.4, 0.5, 0.6, 0.7), PredSemantic_FM = c(1, 2, 2, 1)
+  PredScore_FM = c(0.4, 0.5, 0.6, 0.7)
 )
 fm_partition <- file.path(work, "fm.bin")
 append_partition(fm_partition, fm_points)
@@ -46,9 +55,9 @@ stopifnot(row$point_count == 2, row$x == 2, row$y == 2,
           row$z == 3.5, row$height_m == 1,  # mean stem-band Zref, extent
           row$species_id == 7,
           isTRUE(all.equal(row$species_prob, 0.85)),
-          row$wood_point_count == 1, row$leaf_point_count == 1,
-          # Every FM score of a merged instance, counted over all batches.
-          identical(row$pred_score_fm_values,
+          !any(c("wood_point_count", "leaf_point_count") %in% names(row)),
+          # Every score of a merged instance, counted over all batches.
+          identical(row$pred_score_values,
                     '[{"score":0.4,"point_count":1},{"score":0.6,"point_count":1}]'),
           is.na(row$dbh_m), row$dbh_quality_code == 1L)  # too few stem points
 
@@ -104,8 +113,7 @@ stopifnot(file.exists(file.path(generated_output, "dtm_full.tif")),
           identical(generated_inventory$point_count, inventory$point_count))
 cat("partition inventory test passed\n")
 
-without_semantic <- data.table::copy(fm_points)
-without_semantic[, PredSemantic_FM := NULL]
-without_semantic <- normalize_inventory_points(without_semantic, dtm)
-row <- inventory_from_points(without_semantic, fm_spec, test_config, NULL, NULL)[instance_id == 1]
-stopifnot(is.na(row$wood_point_count), is.na(row$leaf_point_count))
+# Without a score attribute there is no score column; non-tree IDs are per segmentation.
+unscored <- normalize_inventory_points(data.table::copy(fm_points), dtm)
+rows <- inventory_from_points(unscored, modifyList(fm_spec, list(score = NULL, non_tree_ids = 2)), test_config, NULL, NULL)
+stopifnot(!"pred_score_values" %in% names(rows), identical(rows$instance_id, 1))

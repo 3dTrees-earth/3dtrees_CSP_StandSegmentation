@@ -33,8 +33,9 @@ validate_dimension <- function(value, label) {
 }
 
 # One segmentation: its instance attribute and, optionally, the species and
-# species-probability attributes that go with it (both or neither).
-segmentation_spec <- function(instance, species = NULL, species_prob = NULL) {
+# species-probability attributes that go with it (both or neither), its
+# prediction score attribute and its non-tree IDs (default 0).
+segmentation_spec <- function(instance, species = NULL, species_prob = NULL, score = NULL, non_tree_ids = 0) {
   if (xor(is.null(species), is.null(species_prob))) {
     abort(sprintf("--species-attribute and --species-probability-attribute must be supplied together for %s", instance))
   }
@@ -43,7 +44,9 @@ segmentation_spec <- function(instance, species = NULL, species_prob = NULL) {
     instance = instance,
     source = sub("^PredInstance_", "", instance),
     species = if (!is.null(species)) validate_dimension(species, "Species attribute"),
-    species_prob = if (!is.null(species_prob)) validate_dimension(species_prob, "Species probability attribute")
+    species_prob = if (!is.null(species_prob)) validate_dimension(species_prob, "Species probability attribute"),
+    score = if (!is.null(score)) validate_dimension(score, "Score attribute"),
+    non_tree_ids = non_tree_ids
   )
 }
 
@@ -114,8 +117,11 @@ usage <- function() {
     "                                     (e.g. species_id_FM; optional)",
     "  --species-probability-attribute NAME  Species probability attribute of the preceding",
     "                                     instance attribute (e.g. species_prob_FM; with species)",
+    "  --score-attribute NAME             Prediction score attribute of the preceding instance",
+    "                                     attribute (e.g. PredScore_FM; optional)",
+    "  --non-tree-ids IDS                 IDs of the preceding instance attribute that are not",
+    "                                     trees, comma-separated (default: 0)",
     "  --inventory-attributes LIST        Additional numeric LAS attributes (comma-separated; default: none)",
-    "  --non-tree-ids IDS                  Comma-separated IDs to exclude (default: 0)",
     "  --enable-csp true|false             Create PredInstance_CSP (default: false)",
     "  --seed-mode automatic|supplied     CSP seed source (default: automatic)",
     "  --seed-file TSV                    X/Y/Z/TreeID table for supplied seeds",
@@ -181,7 +187,6 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     output_dir = NULL,
     segmentation_specs = list(),
     inventory_attributes = character(),
-    non_tree_ids = 0,
     enable_csp = FALSE,
     seed_mode = "automatic",
     seed_file = NULL,
@@ -236,8 +241,8 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
   }
 
   segmentations <- list()
-  # Species options belong to the most recent --instance-attribute.
-  set_species <- function(field, key, value) {
+  # Species, score and non-tree options belong to the most recent --instance-attribute.
+  set_option <- function(field, key, value) {
     last <- length(segmentations)
     if (!last) abort(sprintf("%s must follow an --instance-attribute", key))
     if (!is.null(segmentations[[last]][[field]])) abort(sprintf("%s given twice for %s", key, segmentations[[last]]$instance))
@@ -254,8 +259,10 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     if (key == "--input") config$input <- value
     else if (key == "--output-dir") config$output_dir <- value
     else if (key == "--instance-attribute") segmentations[[length(segmentations) + 1L]] <- list(instance = value)
-    else if (key == "--species-attribute") set_species("species", key, value)
-    else if (key == "--species-probability-attribute") set_species("species_prob", key, value)
+    else if (key == "--species-attribute") set_option("species", key, value)
+    else if (key == "--species-probability-attribute") set_option("species_prob", key, value)
+    else if (key == "--score-attribute") set_option("score", key, value)
+    else if (key == "--non-tree-ids") set_option("non_tree_ids", key, parse_non_tree_ids(value))
     else if (key == "--inventory-attributes") {
       values <- trimws(strsplit(value, ",", fixed = TRUE)[[1L]])
       if (!length(values) || any(!nzchar(values)) || endsWith(value, ",")) abort("--inventory-attributes requires dimension names")
@@ -263,7 +270,6 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
       if (any(values %in% c("Zref", "source_order__"))) abort("Reserved inventory attribute")
       config$inventory_attributes <- unique(c(config$inventory_attributes, values))
     }
-    else if (key == "--non-tree-ids") config$non_tree_ids <- parse_non_tree_ids(value)
     else if (key == "--enable-csp") config$enable_csp <- parse_bool(value, key)
     else if (key == "--seed-mode") config$seed_mode <- value
     else if (key == "--seed-file") config$seed_file <- value
@@ -339,7 +345,8 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     abort("--slice-width may not exceed half of --slice-increment")
   }
   config$segmentation_specs <- lapply(segmentations, function(value) {
-    spec <- segmentation_spec(value$instance, value$species, value$species_prob)
+    spec <- segmentation_spec(value$instance, value$species, value$species_prob, value$score,
+                              if (is.null(value$non_tree_ids)) 0 else value$non_tree_ids)
     spec$attributes <- config$inventory_attributes
     spec
   })

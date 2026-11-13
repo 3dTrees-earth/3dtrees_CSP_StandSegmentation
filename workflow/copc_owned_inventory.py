@@ -17,6 +17,7 @@ from array import array
 from collections import namedtuple
 import json
 import math
+import os
 from pathlib import Path
 import resource
 import sys
@@ -157,8 +158,28 @@ def summarize_batch(states, points, instance, non_tree):
         state["maxs_raw"] = [max(a, int(b)) for a, b in zip(state["maxs_raw"], maxima[i])]
 
 
-def plan_windows(instances, origin, size, buffer):
-    """One window per core: its halo grown to the full extent of every owned tree."""
+def split_members(members, max_points):
+    """Whole trees in groups of at most max_points (one oversized tree stays alone),
+    split at the median point along the longer axis of the tree centroids."""
+    if len(members) == 1 or sum(p["count"] for p in members) <= max_points:
+        return [members]
+    xs = [p["centroid"][0] for p in members]
+    ys = [p["centroid"][1] for p in members]
+    axis = 0 if max(xs) - min(xs) >= max(ys) - min(ys) else 1
+    ordered = sorted(members, key=lambda p: (p["centroid"][axis], p["id"]))
+    half, running, cut = sum(p["count"] for p in ordered) / 2, 0, 1
+    for i, p in enumerate(ordered[:-1], start=1):
+        running += p["count"]
+        cut = i
+        if running >= half:
+            break
+    return split_members(ordered[:cut], max_points) + split_members(ordered[cut:], max_points)
+
+
+def plan_windows(instances, origin, size, buffer, max_points=None):
+    """One window per core: its halo grown to the full extent of every owned tree.
+    A core holding more than max_points is split into windows of whole trees, so
+    the memory a window needs stays within the job's grant."""
     if not math.isfinite(size) or size <= 0 or not math.isfinite(buffer) or buffer < 0:
         raise ValueError("Invalid owned core size or buffer")
     cores = {}
@@ -168,16 +189,22 @@ def plan_windows(instances, origin, size, buffer):
         cores.setdefault(core, []).append(instance)
     windows = []
     for core, members in sorted(cores.items()):
-        members = sorted(members, key=lambda item: item["id"])
         core_min = [o + c * size for o, c in zip(origin, core)]
         halo_min = [v - buffer for v in core_min]
         halo_max = [v + size + buffer for v in core_min]
-        minimum = [min(halo_min[axis], *(p["mins"][axis] for p in members)) for axis in (0, 1)]
-        maximum = [max(halo_max[axis], *(p["maxs"][axis] for p in members)) for axis in (0, 1)]
-        windows.append({"owner_core": list(core), "ids": [p["id"] for p in members],
-                        "counts": [p["count"] for p in members],
-                        "mins": minimum, "maxs": maximum,
-                        "expanded": minimum != halo_min or maximum != halo_max})
+        groups = split_members(members, max_points) if max_points else [members]
+        for group in groups:
+            group = sorted(group, key=lambda item: item["id"])
+            if len(groups) == 1:
+                minimum = [min(halo_min[axis], *(p["mins"][axis] for p in group)) for axis in (0, 1)]
+                maximum = [max(halo_max[axis], *(p["maxs"][axis] for p in group)) for axis in (0, 1)]
+            else:
+                minimum = [min(p["mins"][axis] for p in group) for axis in (0, 1)]
+                maximum = [max(p["maxs"][axis] for p in group) for axis in (0, 1)]
+            windows.append({"owner_core": list(core), "ids": [p["id"] for p in group],
+                            "counts": [p["count"] for p in group],
+                            "mins": minimum, "maxs": maximum,
+                            "expanded": minimum != halo_min or maximum != halo_max})
     return windows
 
 
@@ -202,7 +229,7 @@ def build_index(config):
                 hull = update_hull(hull, np.asarray(points.x), np.asarray(points.y))
                 for layout in layouts:
                     summarize_batch(states[layout["slug"]], points, dimension_names[layout["instance"]],
-                                    np.atleast_1d(config["non_tree_ids"]))
+                                    np.atleast_1d(layout.get("non_tree_ids", [0])))
                 print(f"copc_index={audit['decoded_points']}/{header.point_count}", file=sys.stderr, flush=True)
         if audit["decoded_points"] != header.point_count:
             raise ValueError("COPC hierarchy count disagrees with the LAS header")
@@ -218,7 +245,7 @@ def build_index(config):
                 instances.append(state)
             layout["instances"] = sorted(instances, key=lambda item: item["id"])
             layout["windows"] = plan_windows(instances, header.mins[:2], config["core_size"],
-                                                config["buffer"])
+                                                config["buffer"], config.get("max_window_points") or None)
         available = list(header.point_format.dimension_names)
         total = int(header.point_count)
     if identity(path) != source_identity:
@@ -229,6 +256,87 @@ def build_index(config):
             "stand_hull": hull.tolist(), "audit": audit,
             "elapsed_seconds": time.monotonic() - started,
             "process_peak_rss_kb": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
+
+
+_DECODER = None
+
+
+def initialize_decoder(header, vlr, selection, columns, dimension_names, instance, ids):
+    global _DECODER
+    _DECODER = header, vlr, selection.to_lazrs(), columns, dimension_names, instance, ids
+
+
+def decode_owned(payload, table, expected):
+    """Decompress one batch of COPC nodes and keep the rows of owned IDs."""
+    import lazrs
+    header, vlr, selection, columns, dimension_names, instance, ids = _DECODER
+    if len(payload) != sum(size for _, size in table) or expected != sum(n for n, _ in table):
+        raise ValueError("Incomplete compressed COPC batch")
+    decoded = np.zeros(expected * header.point_format.size, dtype=np.uint8)
+    lazrs.decompress_points_with_chunk_table(payload, vlr, decoded, table, selection)
+    record = laspy.PackedPointRecord.from_buffer(decoded, header.point_format)
+    points = laspy.ScaleAwarePointRecord(record.array, record.point_format, header.scales, header.offsets)
+    if len(points) != expected:
+        raise ValueError("COPC node decompression returned an incomplete batch")
+    return owned_rows(points, columns, dimension_names, instance, ids) + (expected,)
+
+
+def owned_rows(points, columns, dimension_names, instance, ids):
+    all_ids = np.asarray(points[dimension_names[instance]])
+    selected = np.flatnonzero(np.isin(all_ids, ids))
+    if not len(selected):
+        return b"", {}
+    kept_ids, counts = np.unique(all_ids[selected], return_counts=True)
+    fields = []
+    for column in columns:
+        if column in ("X", "Y", "Z"):
+            fields.append(np.asarray(getattr(points, column.lower()))[selected])
+        else:
+            fields.append(np.asarray(points[dimension_names[column]])[selected])
+    payload = np.column_stack(fields).astype("<f8", copy=False).tobytes()
+    return payload, {int(key): int(count) for key, count in zip(kept_ids, counts)}
+
+
+def parallel_owned_batches(reader, bounds, config, columns, dimension_names, instance, ids, groups, audit):
+    """Owned rows of a window, decoded by a process pool, delivered in node order.
+
+    The main process reads compressed node bytes and hands them to decoders,
+    which return only the owned rows; at most `workers` batches are in flight.
+    """
+    from concurrent.futures import ProcessPoolExecutor
+    import multiprocessing
+    from collections import deque
+    from copc_parallel_index import batches, read_batch
+    workers = int(config["decode_workers"])
+    for name in ("RAYON_NUM_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS"):
+        os.environ[name] = "1"
+    data = array("Q")
+    for node in hierarchy_nodes(reader, bounds):
+        if node.byte_size <= 0 or node.offset < 0:
+            raise ValueError("Invalid COPC data range")
+        data.extend((node.offset, node.byte_size, node.point_count))
+    nodes = np.frombuffer(data, dtype=np.uint64).reshape(-1, 3)
+    order = np.argsort(nodes[:, 0], kind="stable")
+    nodes = nodes[order]
+    if len(nodes) and np.any(nodes[1:, 0] < nodes[:-1, 0] + nodes[:-1, 1]):
+        raise ValueError("Overlapping or duplicate COPC nodes")
+    audit.update(hierarchy_points=int(nodes[:, 2].sum()) if len(nodes) else 0, node_count=len(nodes),
+                 decoded_points=0, max_batch_points=0, decode_workers=workers)
+    limit = min(config["batch_points"], max(1, (256 * 1024**2) // reader.header.point_format.size))
+    initialization = (reader.header, reader.laszip_vlr.record_data,
+                      decompression_groups(reader.header, set(columns))[0],
+                      columns, dimension_names, instance, ids)
+    pending = deque()
+    with ProcessPoolExecutor(workers, mp_context=multiprocessing.get_context("spawn"),
+                             initializer=initialize_decoder, initargs=initialization) as pool:
+        for batch, count, size in batches(nodes, limit):
+            while len(pending) >= workers:
+                yield pending.popleft().result()
+            payload, table = read_batch(reader.source, batch, size)
+            pending.append(pool.submit(decode_owned, payload, table, count))
+            del payload
+        while pending:
+            yield pending.popleft().result()
 
 
 def stream_window(config, index, slug, window_index, output):
@@ -251,28 +359,28 @@ def stream_window(config, index, slug, window_index, output):
         bounds = bounds.ensure_3d(reader.header.mins, reader.header.maxs)
         if np.all(bounds.mins <= reader.header.mins) and np.all(bounds.maxs >= reader.header.maxs):
             bounds = None
-        for points in iter_batches(reader, bounds, config["batch_points"], audit):
-            all_ids = np.asarray(points[dimension_names[layout["instance"]]])
-            selected = np.flatnonzero(np.isin(all_ids, ids))
-            if not len(selected):
+        if int(config.get("decode_workers", 1)) > 1:
+            def owned():
+                for payload, counts, decoded in parallel_owned_batches(
+                        reader, bounds, config, layout["columns"], dimension_names, layout["instance"], ids, groups, audit):
+                    audit["decoded_points"] += decoded
+                    audit["max_batch_points"] = max(audit["max_batch_points"], decoded)
+                    yield payload, counts
+        else:
+            def owned():
+                for points in iter_batches(reader, bounds, config["batch_points"], audit):
+                    yield owned_rows(points, layout["columns"], dimension_names, layout["instance"], ids)
+        # The expanded window contains every owned ID's entire extent. Owned
+        # points are kept even in nodes overlapping the window edge; nodes are
+        # disjoint, so this cannot create duplicate points.
+        for payload, counts in owned():
+            if not counts:
                 continue
-            # The expanded window contains every owned ID's entire extent.
-            # Keep owned points even in nodes overlapping the window edge;
-            # nodes are disjoint, so this cannot create duplicate points.
-            kept_ids, counts = np.unique(all_ids[selected], return_counts=True)
-            for key, count in zip(kept_ids, counts):
-                key = int(key)
-                observed[key] += int(count)
+            for key, count in counts.items():
+                observed[key] += count
                 if observed[key] > expected[key]:
                     raise ValueError(f"Duplicate/excess points for instance {key}")
-            fields = []
-            for column in layout["columns"]:
-                if column in ("X", "Y", "Z"):
-                    values = np.asarray(getattr(points, column.lower()))[selected]
-                else:
-                    values = np.asarray(points[dimension_names[column]])[selected]
-                fields.append(values)
-            output.write(np.column_stack(fields).astype("<f8", copy=False).tobytes())
+            output.write(payload)
             print(f"copc_window={window_index} decoded={audit['decoded_points']} owned={sum(observed.values())}/{sum(expected.values())}", file=sys.stderr, flush=True)
         output.flush()
     if observed != expected:

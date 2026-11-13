@@ -16,8 +16,10 @@ attributes and adds `PredInstance_CSP`.
 
 The default inventory read is **XYZ + the instance dimension**. Optional
 species/probability fields are read only when named with `--species-attribute` and `--species-probability-attribute`.
-Use `--inventory-attributes PredScore_FM,PredSemantic_FM` to opt into FM score
-and semantic summaries. This flag accepts a comma-separated list of numeric,
+Each segmentation can also name its prediction score attribute with
+`--score-attribute` (for example `PredScore_FM`) and its own non-tree IDs with
+`--non-tree-ids` (default 0); like the species options, both belong to the
+`--instance-attribute` before them. `--inventory-attributes` accepts a comma-separated list of numeric,
 scalar LAS attributes and can be repeated; requested missing attributes fail
 validation. Arbitrary selected attributes are available to the inventory path
 and preserved in CSP point-cloud output; selection alone does not define new
@@ -53,8 +55,7 @@ the `sequential` scan, so it needs no COPC conversion. Several input files and
 memory in proportion to the points per tile. `run_metadata.json` records the
 reader that was used as `read_mode`.
 
-Add `--inventory-attributes PredScore_FM,PredSemantic_FM` for those optional
-measurements. Include the selected column count (XYZ + instance + optional
+Include the selected column count (XYZ + instance + optional
 fields) in resource estimation through `--inventory-columns` when it exceeds
 the estimator's conservative eight-column default.
 
@@ -81,7 +82,7 @@ trees with FM species:
 --species-probability-attribute species_prob_FM`. Without species attributes,
 the inventory omits species columns. Run `Rscript exec/run.R --help` for all controls.
 
-Common controls are the merged COPC or LAS/LAZ input, repeatable segmentation specs, non-tree IDs,
+Common controls are the merged COPC or LAS/LAZ input, repeatable segmentation specs with their species, score and non-tree IDs,
 optional CSP and seed source, optional native-CRS AOI GeoJSON, an optional DTM,
 DTM resolution (default 0.2 m when generated), and random seed.
 The source point cloud must declare a projected metre CRS. The CLI can recover
@@ -153,8 +154,7 @@ Units are also listed per field in `manifest.json`.
 | `species_id`, `species_prob` | | Modal species ID and median probability of the points with that ID (only with species dimensions) |
 | `species_conflict_fraction` | | Share of the tree's points with another species ID |
 | `scientific_name`, `common_name`, `taxonomy_version`, `model_version` | | From `--species-lookup`, when supplied |
-| `pred_score_fm_values` | | Every distinct `PredScore_FM` of the tree with its point count as JSON (`[{"score":0.83,"point_count":12000}, ...]`, most points first; counted over all points). An instance merged from several FM instances shows each one's score (FM, only with `--inventory-attributes PredScore_FM`) |
-| `wood_point_count`, `leaf_point_count`, `wood_share`, `leaf_share` | | From `PredSemantic_FM` (FM, only with `--inventory-attributes PredSemantic_FM`) |
+| `pred_score_values` | | Every distinct value of the segmentation's `--score-attribute` in the tree with its point count as JSON (`[{"score":0.83,"point_count":12000}, ...]`, most points first; counted over all points). An instance merged from several predicted instances shows each one's score. Only for segmentations with a score attribute |
 | `dbh_quality_code`, `dbh_quality_label` | | 1 `too_few_stem_slice_points`, 2 `fallback_circle_estimate`, 3 `rejected_or_unstable_fit`, 4 `spline_fit`, 9 no measurement; the label is `dbh_unavailable` whenever `dbh_m` is null |
 | `dbh_runs`, `dbh_runs_fitted`, `dbh_spread_m` | –, –, m | DBH runs made, runs that produced a DBH, and max − min of their DBH values |
 | `dbh_band_points` | – | Grid points between `--slice-min` and `--slice-max`, all used for DBH |

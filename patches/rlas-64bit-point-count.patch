@@ -1,0 +1,75 @@
+diff --color -ru base/src/readheader.cpp src/src/readheader.cpp
+--- a/src/readheader.cpp	2026-09-02 21:26:06.000000000 +0200
++++ b/src/readheader.cpp	2026-11-11 09:55:01.933411140 +0100
+@@ -100,20 +100,34 @@
+     // Added support of LAS 1.4
+     if (lasheader->version_minor == 4)
+     {
++      // 3Dtrees: counts above INT_MAX come back as doubles (exact below 2^53);
++      // smaller files keep the integer header they always had.
+       if (lasheader->extended_number_of_point_records > 2147483647)
+-        throw std::runtime_error("R cannot handle more than 2147483647 points.");
+-
+-      head.push_back((int)lasheader->extended_number_of_point_records);
+-      IntegerVector extended_number_of_points_by_return(15);
+-      for(int i = 0 ; i < 15 ; i++) extended_number_of_points_by_return[i] = (int)lasheader->extended_number_of_points_by_return[i];
+-      head.push_back(extended_number_of_points_by_return);
++        head.push_back((double)lasheader->extended_number_of_point_records);
++      else
++        head.push_back((int)lasheader->extended_number_of_point_records);
++      bool large_returns = false;
++      for(int i = 0 ; i < 15 ; i++) large_returns = large_returns || lasheader->extended_number_of_points_by_return[i] > 2147483647;
++      if (large_returns)
++      {
++        NumericVector extended_number_of_points_by_return(15);
++        for(int i = 0 ; i < 15 ; i++) extended_number_of_points_by_return[i] = (double)lasheader->extended_number_of_points_by_return[i];
++        head.push_back(extended_number_of_points_by_return);
++      }
++      else
++      {
++        IntegerVector extended_number_of_points_by_return(15);
++        for(int i = 0 ; i < 15 ; i++) extended_number_of_points_by_return[i] = (int)lasheader->extended_number_of_points_by_return[i];
++        head.push_back(extended_number_of_points_by_return);
++      }
+     }
+     else
+     {
++      // 3Dtrees: as above for the legacy 32-bit count.
+       if (lasheader->number_of_point_records > 2147483647)
+-        throw std::runtime_error("R cannot handle more than 2147483647 points.");
+-
+-      head.push_back((int)lasheader->number_of_point_records);
++        head.push_back((double)lasheader->number_of_point_records);
++      else
++        head.push_back((int)lasheader->number_of_point_records);
+ 
+       IntegerVector number_of_points_by_return(5);
+       for(int i = 0 ; i < 5 ; i++) number_of_points_by_return[i] = (int)lasheader->number_of_points_by_return[i];
+diff --color -ru base/src/rlasstreamer.cpp src/src/rlasstreamer.cpp
+--- a/src/rlasstreamer.cpp	2026-11-11 09:55:01.930411113 +0100
++++ b/src/rlasstreamer.cpp	2026-11-11 09:55:01.933411140 +0100
+@@ -243,7 +243,8 @@
+     format   = get_format(point_type);
+     extended = (lasreader->header.version_minor >= 4) && (format >= 6);
+ 
+-    int npoints = lasreader->header.number_of_point_records;
++    // 3Dtrees: the unsigned 32-bit count can exceed INT_MAX; keep it 64-bit.
++    I64 npoints = lasreader->header.number_of_point_records;
+ 
+     bool has_rgb = (format == 2 || format == 3 || format == 5 || format == 7 || format == 8 || format == 10);
+     bool has_t   = (format == 1 || format >= 3);
+@@ -256,9 +257,11 @@
+     cha = cha && extended;
+ 
+     if (useFilter)
+-      nalloc = ceil((float)npoints/8);
++      nalloc = (int)std::min<I64>((I64)ceil((double)npoints/8), 2147483647);
++    else if (npoints > 2147483647)
++      throw std::runtime_error("R cannot read more than 2147483647 points at once; read a spatial subset.");
+     else
+-      nalloc = npoints;
++      nalloc = (int)npoints;
+   }
+ 
+   is_RN_populated = false;
+Only in src/src: rlasstreamer.cpp.orig

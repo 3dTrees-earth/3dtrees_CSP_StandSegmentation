@@ -1,5 +1,5 @@
 .csp_workflow_dir <- dirname(normalizePath(sys.frame(1)$ofile, mustWork = TRUE))
-for (.csp_module in c("table_formats.R", "dbh_evidence.R", "instance_inventory.R", "partition_inventory.R", "owned_inventory.R",
+for (.csp_module in c("table_formats.R", "dbh_evidence.R", "terrain.R", "instance_inventory.R", "partition_inventory.R", "owned_inventory.R",
                       "inventory_readers.R", "inventory_run.R")) {
   source(file.path(.csp_workflow_dir, .csp_module), local = TRUE)
 }
@@ -59,7 +59,31 @@ point_cloud_crs <- function(header) {
     parse_wkt(header@VLR)
   )
   valid <- Filter(function(crs) !is.null(crs) && !is.na(crs), candidates)
-  if (!length(valid)) abort("Point cloud has no parseable CRS in its header or WKT records")
+  if (!length(valid)) {
+    # lidR does not decode geocentric GeoKeys for LAS 1.4. The geographic
+    # key can also describe the base datum of a user-defined projection.
+    tags <- c(header@EVLR[["GeoKeyDirectoryTag"]]$tags, header@VLR[["GeoKeyDirectoryTag"]]$tags)
+    inline_values <- function(key) {
+      matching <- Filter(function(tag) tag$key == key && tag[["tiff tag location"]] == 0L &&
+                           tag$count == 1L, tags)
+      values <- unique(vapply(matching, `[[`, integer(1), "value offset"))
+      if (length(values) > 1L) abort("Point cloud header contains conflicting CRS GeoKeys")
+      values
+    }
+    model <- inline_values(1024L)
+    geographic_or_geocentric <- isTRUE(model %in% c(2L, 3L))
+    if (!length(model) || isTRUE(model == 1L) || geographic_or_geocentric) {
+      epsg <- inline_values(if (geographic_or_geocentric) 2048L else 3072L)
+      crs <- if (isTRUE(epsg %in% 1024:32766)) {
+        tryCatch(sf::st_crs(epsg), error = function(error) sf::NA_crs_)
+      } else sf::NA_crs_
+      if (!is.na(crs)) return(crs)
+      if (isTRUE(model == 1L) || isTRUE(epsg == 32767L)) {
+        abort("Point cloud header declares a CRS without a supported projected EPSG code or WKT")
+      }
+    }
+    return(sf::NA_crs_)
+  }
   if (any(vapply(valid[-1L], function(crs) crs != valid[[1L]], logical(1)))) {
     abort("Point cloud header contains conflicting valid CRS records")
   }
@@ -152,12 +176,35 @@ make_dtm <- function(las, resolution) {
   list(las = grounded, dtm = dtm, method = method)
 }
 
-load_supplied_dtm <- function(path, source_crs, bounds, stage_dir) {
+warn_unused_dtm_crs_override <- function(config, crs) {
+  if (isTRUE(config$dtm_crs_local_ok) && !local_inventory_crs(crs)) {
+    message("WARNING: --dtm-crs-local-ok has no effect for a projected point cloud")
+  }
+}
+
+load_supplied_dtm <- function(path, source_crs, bounds, stage_dir, dtm_crs_local_ok = FALSE) {
   if (!file.exists(path) || dir.exists(path)) abort(sprintf("DTM does not exist: %s", path))
-  dtm <- terra::rast(path)
+  dtm <- terra::rast(path, guessCRS = FALSE)
   if (terra::nlyr(dtm) != 1L) abort("Supplied DTM must have exactly one raster band")
-  raster_crs <- sf::st_crs(terra::crs(dtm))
-  if (!same_horizontal_crs(source_crs, raster_crs, bounds)) {
+  raster_wkt <- terra::crs(dtm)
+  raster_crs <- sf::st_crs(if (nzchar(raster_wkt)) raster_wkt else NA_character_)
+  local <- local_inventory_crs(source_crs)
+  dropped_crs_wkt <- NULL
+  matching <- if (local) {
+    projected_metres <- !is.na(raster_crs) &&
+      grepl("^(BOUNDCRS\\[\\s*SOURCECRS\\[\\s*)?(PROJCRS|PROJCS|DERIVEDPROJCRS)\\[", raster_crs$wkt) &&
+      tolower(raster_crs$units_gdal %||% "") %in% c("metre", "meter", "metres", "meters")
+    if (projected_metres) {
+      if (!isTRUE(dtm_crs_local_ok)) {
+        abort(paste("A local point cloud requires a DTM without a CRS or with the local EPSG:4978 stand-in.",
+                    "Use --dtm-crs-local-ok true only if the projected DTM is already in the cloud's metre coordinates."))
+      }
+      dropped_crs_wkt <- raster_wkt
+    }
+    is.na(raster_crs) || (is_inventory_standin(raster_crs) && near_geocentric_origin(bounds)) ||
+      projected_metres
+  } else same_horizontal_crs(source_crs, raster_crs, bounds)
+  if (!matching) {
     abort("Supplied DTM and point cloud must have the same valid CRS or equivalent horizontal CRS")
   }
   if (terra::xmin(dtm) > bounds$xmin || terra::xmax(dtm) < bounds$xmax ||
@@ -165,12 +212,42 @@ load_supplied_dtm <- function(path, source_crs, bounds, stage_dir) {
     abort("Supplied DTM must cover the full point-cloud extent")
   }
   output <- file.path(stage_dir, "dtm_full.tif")
-  if (!file.copy(path, output, overwrite = TRUE)) abort("Could not stage the supplied DTM")
+  if (local && !same_local_inventory_crs(source_crs, raster_crs)) {
+    # The full extent check above compares native XY values. Preserve those
+    # values while carrying the cloud's local frame into the output.
+    terra::crs(dtm) <- source_crs$wkt %||% ""
+    write_geotiff(dtm, output)
+  } else if (!file.copy(path, output, overwrite = TRUE)) {
+    abort("Could not stage the supplied DTM")
+  }
+  if (!is.null(dropped_crs_wkt)) {
+    message("WARNING: --dtm-crs-local-ok dropped the projected DTM CRS and used the cloud's local frame")
+  }
   list(
-    las = NULL, dtm = terra::rast(output), method = "supplied", strategy = "supplied",
-    workers = 0L, valid_chunk_count = 0L, candidate_metadata = NULL,
+    las = NULL, dtm = terra::rast(output, guessCRS = FALSE), method = "supplied", strategy = "supplied",
+    workers = 0L, valid_chunk_count = 0L, candidate_metadata = NULL, dropped_crs_wkt = dropped_crs_wkt,
     worker_peak_rss_sum_kb = 0, worker_peak_rss_max_kb = 0
   )
+}
+
+record_inventory_terrain_fills <- function(result, distances) {
+  result$filled_cells <- length(distances)
+  result$max_fill_distance_m <- max(c(0, distances))
+  if (result$filled_cells > 0L) {
+    message(sprintf("WARNING: DTM height lookup used %d filled NoData cells (largest fill distance: %.6g m)",
+                    result$filled_cells, result$max_fill_distance_m))
+  }
+  result
+}
+
+inventory_terrain_metadata <- function(config, result) {
+  fields <- list(terrain_lookup = config$dtm_lookup,
+                 fill_radius_cells = config$dtm_fill_radius,
+                 fill_cap_m = terrain_fill_cap(result$dtm, config),
+                 filled_cells = result$filled_cells %||% 0L,
+                 max_fill_distance_m = result$max_fill_distance_m %||% 0)
+  if (!is.null(result$dropped_crs_wkt)) fields$dropped_crs_wkt <- result$dropped_crs_wkt
+  fields
 }
 
 same_horizontal_crs <- function(source_crs, target_crs, bounds, tolerance_m = 0.001) {
@@ -203,7 +280,7 @@ read_aoi <- function(path, las_crs) {
   # AOI coordinates are defined by the CLI contract to already be in the
   # point-cloud CRS. GeoJSON readers otherwise label them as WGS84 even when
   # they contain projected native coordinates, so assign rather than transform.
-  sf::st_crs(aoi) <- las_crs
+  sf::st_crs(aoi) <- if (local_inventory_crs(las_crs)) sf::NA_crs_ else las_crs
   aoi <- sf::st_make_valid(aoi)
   union <- sf::st_union(sf::st_geometry(aoi))
   if (length(union) != 1L || sf::st_is_empty(union)) abort("AOI geometry is empty after normalization")
@@ -370,11 +447,20 @@ run_csp <- function(las, config, stage_dir) {
   )
 }
 
-# A 3D projected CRS (e.g. "Promoted to 3D from EPSG:32616") as its 2D
-# version: GeoTIFF keys hold only horizontal CRSs, and GDAL would otherwise
+is_geocentric_wkt <- function(wkt) {
+  source <- sub("^BOUNDCRS\\[\\s*SOURCECRS\\[\\s*", "", wkt)
+  if (grepl("^GEOCCS\\[", source)) return(TRUE)
+  if (!grepl("^(GEODCRS|GEODETICCRS)\\[", source)) return(FALSE)
+  # Inspect the source coordinate system, not the BOUNDCRS target.
+  source <- sub("(?s)\\]\\s*,\\s*TARGETCRS\\[.*$", "", source, perl = TRUE)
+  grepl("CS\\[\\s*Cartesian\\s*,\\s*3\\s*\\]", source)
+}
+
+# Reduce a non-geocentric 3D Cartesian CRS to its horizontal 2D version.
+# GeoTIFF keys hold only horizontal CRSs, and GDAL would otherwise
 # write the CRS to a .aux.xml side file and a wrong one into the GeoTIFF.
 horizontal_wkt <- function(wkt) {
-  if (!grepl("CS\\[Cartesian,\\s*3\\]", wkt)) return(wkt)
+  if (is_geocentric_wkt(wkt) || !grepl("CS\\[Cartesian,\\s*3\\]", wkt)) return(wkt)
   chars <- strsplit(wkt, "", fixed = TRUE)[[1L]]
   for (start in rev(as.integer(gregexpr("AXIS[", wkt, fixed = TRUE)[[1L]]))) {
     depth <- 0L
@@ -392,9 +478,15 @@ horizontal_wkt <- function(wkt) {
 }
 
 # DEFLATE without predictor: lossless and readable by every TIFF reader.
-write_geotiff <- function(raster, path) {
+write_geotiff <- function(raster, path, ...) {
   terra::crs(raster) <- horizontal_wkt(terra::crs(raster))
-  terra::writeRaster(raster, path, overwrite = TRUE, gdal = "COMPRESS=DEFLATE")
+  terra::writeRaster(raster, path, overwrite = TRUE, gdal = "COMPRESS=DEFLATE", ...)
+}
+
+write_aoi_dtm <- function(dtm, aoi, path, local) {
+  polygon <- terra::vect(aoi)
+  if (local) terra::crs(polygon) <- terra::crs(dtm)
+  write_geotiff(terra::mask(terra::crop(dtm, polygon), polygon), path)
 }
 
 # The CSP cloud is the whole input, every dimension kept, plus PredInstance_CSP.
@@ -460,6 +552,8 @@ point_cloud_bounds <- function(files) {
     xmax = max(vapply(headers, function(x) x@PHB[["Max X"]], numeric(1))),
     ymin = min(vapply(headers, function(x) x@PHB[["Min Y"]], numeric(1))),
     ymax = max(vapply(headers, function(x) x@PHB[["Max Y"]], numeric(1))),
+    zmin = min(vapply(headers, function(x) x@PHB[["Min Z"]], numeric(1))),
+    zmax = max(vapply(headers, function(x) x@PHB[["Max Z"]], numeric(1))),
     headers = headers,
     crs = crs[[1L]]
   )
@@ -481,10 +575,12 @@ point_cloud_bounds_python <- function(file, work_dir) {
                   if (nzchar(detail)) paste0(":\n", detail) else ""))
   }
   header <- jsonlite::fromJSON(output, simplifyVector = TRUE)
+  crs <- tryCatch(sf::st_crs(header$crs_wkt %||% NA_character_), error = function(error) sf::NA_crs_)
+  if (is.na(crs)) crs <- point_cloud_bounds(file)$crs
   list(xmin = header$xmin, xmax = header$xmax,
        ymin = header$ymin, ymax = header$ymax,
-       # Without a WKT record (LAS 1.2 GeoTIFF keys), lidR reads the CRS.
-       crs = if (is.null(header$crs_wkt)) point_cloud_bounds(file)$crs else sf::st_crs(header$crs_wkt),
+       zmin = header$zmin, zmax = header$zmax,
+       crs = crs,
        point_count = as.numeric(header$point_count),
        available_dimensions = header$available_dimensions,
        headers = NULL)
@@ -587,11 +683,12 @@ chunked_dtm <- function(files, chunks, buffer, resolution, work_dir, stage_dir, 
   dtm <- terra::extend(dtm, target)
   # The DTM is in the point cloud's CRS, also when the ground candidates (or
   # lidR) could not carry it, as for a 3D projected WKT.
-  if (!is.null(crs)) terra::crs(dtm) <- crs$wkt
+  if (!is.null(crs)) terra::crs(dtm) <- crs$wkt %||% ""
+  names(dtm) <- "dtm"
   output <- file.path(stage_dir, "dtm_full.tif")
   write_geotiff(dtm, output)
   list(
-    dtm = terra::rast(output),
+    dtm = terra::rast(output, guessCRS = FALSE),
     method = if (all(methods == "classification_2")) "chunked_classification_2" else "chunked_csf",
     chunk_count = length(chunks),
     valid_chunk_count = length(partials),
@@ -642,7 +739,7 @@ streaming_dtm_candidates <- function(files, config, work_dir) {
 
 make_inventory_dtm <- function(files, bounds, config, work_dir, stage_dir) {
   if (!is.null(config$dtm)) {
-    return(load_supplied_dtm(config$dtm, bounds$crs, bounds, stage_dir))
+    return(load_supplied_dtm(config$dtm, bounds$crs, bounds, stage_dir, config$dtm_crs_local_ok))
   }
   input_points <- if (!is.null(bounds$point_count)) bounds$point_count else
     sum(vapply(bounds$headers, header_point_count, numeric(1)))
@@ -682,6 +779,7 @@ run_tool <- function(config) {
   files <- resolve_input_files(config$input)
   config <- resolve_inventory_read_mode(config, files)
   config$coordinate_frame <- coordinate_frame(files)
+  message(sprintf("CSP workflow: %s DTM lookup", config$dtm_lookup))
   output_parent <- dirname(config$output_dir)
   dir.create(output_parent, recursive = TRUE, showWarnings = FALSE)
   stage_dir <- tempfile("csp-stage-", tmpdir = output_parent)
@@ -702,8 +800,10 @@ run_tool <- function(config) {
     return(invisible(resources))
   }
 
-  source_crs <- point_cloud_bounds(files)$crs
-  validate_inventory_crs(source_crs)
+  bounds <- point_cloud_bounds(files)
+  source_crs <- bounds$crs
+  validate_inventory_crs(source_crs, bounds)
+  warn_unused_dtm_crs_override(config, source_crs)
 
   read_specs <- c(config$segmentation_specs, list(list(attributes = unique(c(
     config$inventory_attributes, if (is.null(config$dtm)) "Classification"
@@ -721,27 +821,30 @@ run_tool <- function(config) {
 
   dtm_result <- if (is.null(config$dtm)) {
     generated <- make_dtm(original_las, config$dtm_resolution)
+    if (local_inventory_crs(source_crs)) terra::crs(generated$dtm) <- source_crs$wkt %||% ""
+    names(generated$dtm) <- "dtm"
     write_geotiff(generated$dtm, file.path(stage_dir, "dtm_full.tif"))
     # Heights come from the written Float32 DTM, as in the inventory readers.
-    generated$dtm <- terra::rast(file.path(stage_dir, "dtm_full.tif"))
+    generated$dtm <- terra::rast(file.path(stage_dir, "dtm_full.tif"), guessCRS = FALSE)
     generated
   } else {
     load_supplied_dtm(
       config$dtm, las_crs,
       list(
         xmin = min(original_las@data$X), xmax = max(original_las@data$X),
-        ymin = min(original_las@data$Y), ymax = max(original_las@data$Y)
+        ymin = min(original_las@data$Y), ymax = max(original_las@data$Y),
+        zmin = bounds$zmin, zmax = bounds$zmax
       ),
-      stage_dir
+      stage_dir, config$dtm_crs_local_ok
     )
   }
   if (!is.null(aoi)) {
-    aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
-    write_geotiff(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"))
+    write_aoi_dtm(dtm_result$dtm, aoi, file.path(stage_dir, "dtm_aoi.tif"), local_inventory_crs(las_crs))
   }
   normalized <- if (is.null(dtm_result$las)) original_las else dtm_result$las
   rm(original_las)
-  normalized@data <- normalize_inventory_points(normalized@data, dtm_result$dtm)
+  fill <- new_terrain_fill(dtm_result$dtm, config)
+  normalized@data <- normalize_inventory_points(normalized@data, dtm_result$dtm, config$dtm_lookup, fill)
   normalized <- lidR::las_update(normalized)
 
   specs <- config$segmentation_specs
@@ -761,11 +864,12 @@ run_tool <- function(config) {
   validate_specs(inventory_las, specs)
   inventories <- list()
   for (spec in specs) {
-    result <- inventory_from_points(inventory_las@data, spec, config, aoi, las_crs, dtm_result$dtm)
+    result <- inventory_from_points(inventory_las@data, spec, config, aoi, las_crs, dtm_result$dtm, fill)
     slug <- gsub("[^A-Za-z0-9_]+", "_", spec$source)
     inventories[[slug]] <- result
   }
   if (config$enable_csp) inventories[["CSP"]] <- add_seed_columns(inventories[["CSP"]], csp$seeds)
+  dtm_result <- record_inventory_terrain_fills(dtm_result, terrain_fill_distances(fill))
   exports <- write_outputs(inventories, area, stage_dir, config, las_crs)
 
   metadata <- list(
@@ -791,7 +895,7 @@ run_tool <- function(config) {
     geometry_threads = config$geometry_threads,
     voxel_resolution_m = config$voxel_resolution
   )
-  write_debug_json(config, metadata, file.path(stage_dir, "run_metadata.json"))
+  write_inventory_run_metadata(config, metadata, dtm_result, stage_dir)
   completed <- Sys.time()
   resources <- list(
     elapsed_seconds = as.numeric(difftime(completed, started, units = "secs")),

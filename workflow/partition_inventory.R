@@ -144,12 +144,13 @@ stream_inventory_partitions_python <- function(files, chunks, specs, config, wor
 # Reads one instance partition in batches and collects every tree in it.
 # A tree always lands in exactly one partition (ID modulo the partition count).
 collect_partition_trees <- function(path, columns, dtm, spec, config,
-                                    batch_points = inventory_batch_points) {
+                                    batch_points = inventory_batch_points, fill = new_terrain_fill(dtm, config)) {
   instance <- spec$instance
   if (file.info(path)$size %% (8L * length(columns)) != 0L) abort(sprintf("Invalid inventory partition: %s", path))
   connection <- file(path, open = "rb")
   on.exit(close(connection), add = TRUE)
   trees <- list()
+  frame <- tree_frame(config, dtm, fill)
   repeat {
     values <- readBin(connection, numeric(), n = as.integer(batch_points * length(columns)),
                       size = 8L, endian = "little")
@@ -157,12 +158,12 @@ collect_partition_trees <- function(path, columns, dtm, spec, config,
     if (length(values) %% length(columns) != 0L) abort(sprintf("Truncated inventory partition: %s", path))
     points <- data.table::as.data.table(matrix(values, ncol = length(columns), byrow = TRUE,
                                                dimnames = list(NULL, columns)))
-    points <- normalize_inventory_points(points, dtm)
+    points <- normalize_inventory_points(points, dtm, config$dtm_lookup, fill)
     points <- points[is.finite(Z) & is.finite(get(instance)) & get(instance) >= 0 &
                        !(get(instance) %in% spec$non_tree_ids)]
     for (id in unique(points[[instance]])) {
       key <- sprintf("%.0f", id)
-      tree <- if (is.null(trees[[key]])) new_tree(tree_frame(config, dtm)) else trees[[key]]
+      tree <- if (is.null(trees[[key]])) new_tree(frame) else trees[[key]]
       trees[[key]] <- add_tree_points(tree, points[get(instance) == id], spec, config)
     }
   }
@@ -170,7 +171,7 @@ collect_partition_trees <- function(path, columns, dtm, spec, config,
 }
 
 inventory_from_partitions <- function(stream, dtm, config, aoi, crs) {
-  inventories <- list()
+  inventories <- fills <- list()
   for (slug in names(stream$layouts)) {
     layout <- stream$layouts[[slug]]
     # Largest partitions first so they do not become the single-worker tail.
@@ -186,11 +187,13 @@ inventory_from_partitions <- function(stream, dtm, config, aoi, crs) {
     process_partition <- function(path) {
       local_dtm <- if (workers > 1L) terra::rast(dtm_source) else dtm
       if (workers > 1L) lidR::set_lidr_threads(1L)
-      trees <- collect_partition_trees(path, layout$columns, local_dtm, layout$spec, config)
+      fill <- new_terrain_fill(local_dtm, config)
+      trees <- collect_partition_trees(path, layout$columns, local_dtm, layout$spec, config, fill = fill)
       rows <- lapply(names(trees), function(key) {
         finish_tree(trees[[key]], as.numeric(key), layout$spec, config, aoi, crs)
       })
-      data.table::rbindlist(rows, use.names = TRUE, fill = TRUE)
+      list(inventory = data.table::rbindlist(rows, use.names = TRUE, fill = TRUE),
+           terrain_fills = terrain_fill_distances(fill))
     }
     partials <- if (workers > 1L) {
       parallel::mclapply(paths, process_partition, mc.cores = workers,
@@ -205,9 +208,11 @@ inventory_from_partitions <- function(stream, dtm, config, aoi, crs) {
       abort(sprintf("Inventory worker failed for %s partition %s: %s", layout$spec$instance,
                     basename(paths[[failed[[1L]]]]), detail))
     }
-    inventory <- inventory_table(partials, layout$spec)
+    fills[[slug]] <- merge_terrain_fills(lapply(partials, `[[`, "terrain_fills"))
+    inventory <- inventory_table(lapply(partials, `[[`, "inventory"), layout$spec)
     if (!nrow(inventory) && is.null(aoi)) abort(sprintf("No valid inventory partitions for %s", layout$spec$instance))
     inventories[[slug]] <- inventory
   }
+  attr(inventories, "terrain_fills") <- merge_terrain_fills(fills)
   inventories
 }

@@ -5,27 +5,33 @@ Requires laspy, numpy, pyproj, and PDAL with writers.copc. The generated COPC
 is committed so the container test does not need a fixture-generation toolchain.
 """
 
+import argparse
 from pathlib import Path
 import subprocess
-import sys
 import tempfile
 
 import laspy
 import numpy as np
-from pyproj import CRS
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        raise SystemExit("usage: generate_multi_instance_copc.py INPUT.las OUTPUT.copc.laz")
-    source_path, output_path = map(Path, sys.argv[1:])
-    source = laspy.read(source_path)
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("source", type=Path)
+    parser.add_argument("output", type=Path)
+    parser.add_argument("--plain-wkt", type=Path, help="write plain LAS/LAZ with this WKT instead of COPC")
+    args = parser.parse_args()
+    source = laspy.read(args.source)
     sampled = source[::8]
     point_count = len(sampled.points)
     header = laspy.LasHeader(point_format=6, version="1.4")
     header.scales = source.header.scales.copy()
     header.offsets = source.header.offsets.copy()
-    header.add_crs(CRS.from_epsg(32632))
+    if args.plain_wkt:
+        header.vlrs.append(laspy.vlrs.known.WktCoordinateSystemVlr(args.plain_wkt.read_text().strip()))
+    else:
+        from pyproj import CRS
+
+        header.add_crs(CRS.from_epsg(32632))
     cloud = laspy.LasData(header)
     cloud.x = sampled.x
     cloud.y = sampled.y
@@ -55,12 +61,15 @@ def main() -> None:
         cloud.add_extra_dim(laspy.ExtraBytesParams(name=name, type=type_name))
         cloud[name] = values
 
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    if args.plain_wkt:
+        cloud.write(args.output)
+        return
     with tempfile.TemporaryDirectory() as directory:
         intermediate = Path(directory) / "multi-instance.las"
         cloud.write(intermediate)
         subprocess.run(
-            ["pdal", "translate", str(intermediate), str(output_path),
+            ["pdal", "translate", str(intermediate), str(args.output),
              "-w", "writers.copc", "--writers.copc.extra_dims=all"],
             check=True,
         )

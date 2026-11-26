@@ -3,27 +3,6 @@
 # Points read per batch from a COPC pipe or partition file.
 inventory_batch_points <- 1000000L
 
-# DTM cell values, read once per file-backed DTM. terra::extract needs about
-# 1 GB per million points; the cell index gives the same values for a fraction.
-terrain_cache <- new.env()
-terrain_values <- function(dtm) {
-  key <- paste(terra::sources(dtm), collapse = "|")
-  if (!nzchar(key)) return(terra::values(dtm, mat = FALSE))
-  if (!identical(terrain_cache$key, key)) {
-    terrain_cache$values <- terra::values(dtm, mat = FALSE)
-    terrain_cache$key <- key
-  }
-  terrain_cache$values
-}
-
-normalize_inventory_points <- function(points, dtm) {
-  terrain <- terrain_values(dtm)[terra::cellFromXY(dtm, cbind(points$X, points$Y))]
-  if (any(!is.finite(terrain))) abort("DTM has missing or non-finite cells under inventoried points")
-  data.table::set(points, j = "Zref", value = points$Z)
-  data.table::set(points, j = "Z", value = points$Z - terrain)
-  points
-}
-
 # Version 1: UTF-8 dimension + exact decimal ID, polynomial hash modulo a
 # 31-bit prime. Double arithmetic stays exact (the multiplier is only 131).
 # Identity, not traversal/window placement or worker assignment, owns the RNG.
@@ -89,7 +68,8 @@ score_values <- function(counts) {
 
 filter_inventory_to_aoi <- function(inventory, aoi, crs) {
   if (is.null(aoi) || !nrow(inventory)) return(inventory)
-  points <- sf::st_as_sf(inventory, coords = c("x", "y"), crs = crs, remove = FALSE)
+  points <- sf::st_as_sf(inventory, coords = c("x", "y"), crs = if (local_inventory_crs(crs)) sf::NA_crs_ else crs,
+                         remove = FALSE)
   inventory[lengths(sf::st_intersects(points, aoi)) > 0L, ]
 }
 
@@ -298,9 +278,9 @@ median_of_counts <- function(counts) {
 # Grid points are kept as the LAS integers (4 bytes per axis instead of 8 for
 # X, Y, Z and Zref) when the run has one coordinate frame; heights above the
 # terrain are recomputed from the same DTM lookup when the tree is measured.
-tree_frame <- function(config, dtm) {
+tree_frame <- function(config, dtm, fill = NULL) {
   if (is.null(config$coordinate_frame) || is.null(dtm)) return(NULL)
-  c(config$coordinate_frame, list(dtm = dtm))
+  c(config$coordinate_frame, list(dtm = dtm, lookup = config$dtm_lookup, fill = fill))
 }
 
 encode_grid <- function(points, frame) {
@@ -339,7 +319,9 @@ compact_grid <- function(tree, size) {
 
 tree_grid <- function(tree, size) {
   grid <- compact_grid(tree, size)
-  if (is.null(tree$frame)) grid else normalize_inventory_points(decode_grid(grid, tree$frame), tree$frame$dtm)
+  if (is.null(tree$frame)) return(grid)
+  frame <- tree$frame
+  normalize_inventory_points(decode_grid(grid, frame), frame$dtm, frame$lookup, frame$fill)
 }
 
 add_tree_points <- function(tree, points, spec, config) {
@@ -413,12 +395,12 @@ inventory_table <- function(rows, spec) {
 }
 
 # Inventory of trees whose points are all in memory (the CSP path and tests).
-inventory_from_points <- function(points, spec, config, aoi, crs, dtm = NULL) {
+inventory_from_points <- function(points, spec, config, aoi, crs, dtm = NULL, fill = NULL) {
   instance <- spec$instance
   points <- points[is.finite(get(instance)) & get(instance) >= 0 & !(get(instance) %in% spec$non_tree_ids)]
   if (!nrow(points)) abort(sprintf("No valid instances remain for requested dimension %s", instance))
   rows <- lapply(split(points, by = instance), function(tree) {
-    finish_tree(add_tree_points(new_tree(tree_frame(config, dtm)), tree, spec, config),
+    finish_tree(add_tree_points(new_tree(tree_frame(config, dtm, fill)), tree, spec, config),
                 tree[[instance]][[1L]], spec, config, aoi, crs)
   })
   inventory_table(rows, spec)

@@ -85,17 +85,65 @@ the inventory omits species columns. Run `Rscript exec/run.R --help` for all con
 Common controls are the merged COPC or LAS/LAZ input, repeatable segmentation specs with their species, score and non-tree IDs,
 optional CSP and seed source, optional native-CRS AOI GeoJSON, an optional DTM,
 DTM resolution (default 0.2 m when generated), and random seed.
-The source point cloud must declare a projected metre CRS. The CLI can recover
-the CRS from a valid extended WKT record when a COPC file has a truncated
-ordinary WKT record, and rejects conflicting valid records. A supplied DTM must
-use the same CRS or an equivalent horizontal CRS and cover the full cloud
-extent. When the GeoTIFF omits a vertical datum, its heights must already use
-the point cloud's vertical datum. The supplied DTM is copied to
-`dtm_full.tif` in the output. With no `--dtm`, the tool generates that file
-(DEFLATE-compressed, no predictor). Both inventory paths look up the terrain
-under each point the same way, in the cell that contains it.
-Missing DTM cells beneath inventoried points stop the run instead of silently
-dismissing those points.
+### Coordinate reference and terrain
+
+Use a projected CRS with metre units when it is known. The CLI can recover the
+CRS from a valid extended WKT record when a COPC file has a truncated ordinary
+WKT record, and rejects conflicting valid records. A supplied DTM must cover the
+full cloud extent and use the same CRS or an equivalent horizontal CRS. When the
+GeoTIFF omits a vertical datum, its heights must already use the point cloud's
+vertical datum.
+
+Clouds with no CRS are inventoried in a local frame that assumes metres. The
+tool refuses unlabelled bounds that span less than one unit in both X and Y,
+have an absolute Z or Z range above 10,000 units, or have a centre 6,350–6,400 km
+from the origin outside plausible UTM coordinates. A centre in this radius band
+with easting between 0 and 1,000,000 m and a nonnegative northing is accepted
+because it can be UTM or near-equatorial ECEF. Supply a verified CRS whenever
+possible. Bounds alone cannot determine the coordinate frame or units.
+
+The tool also accepts the EPSG:4978 stand-in used by 3Dtrees Standardization,
+including equivalent WGS 84 geocentric WKT without an EPSG ID, when every
+bounding-box corner lies within 6,000 km of the origin. It preserves stored
+coordinates and leaves longitude and latitude blank. It refuses geographic and
+other geocentric CRS inputs, including a wrapped stand-in with any corner at or
+beyond 6,000 km. A wrapped cloud in that range needs upstream correction before
+inventory.
+
+For a local cloud, supply an unlabelled DTM or a DTM with the EPSG:4978 stand-in
+in the same local frame. `--dtm-crs-local-ok true` permits a projected metre DTM
+only when its cells already use the cloud's coordinates. The default is
+`false`. The opt-in assigns the cloud's frame without reprojection and logs
+a warning when it drops the projected CRS. The debug manifest and run metadata
+record the original DTM WKT. The tool warns when the flag is set for a projected
+point cloud, where the flag has no effect.
+
+A matching supplied DTM is copied to `dtm_full.tif`. Without `--dtm`, the tool
+generates a DEFLATE-compressed GeoTIFF and gives the band the stable name
+`dtm`. The full DTM and any `dtm_aoi.tif` retain their original elevations and
+NoData.
+
+- `--dtm-lookup bilinear|nearest` defaults to `bilinear`: each point's ground
+  height is interpolated between the four surrounding cell centres, so heights
+  follow slopes instead of cell steps. `nearest` uses the cell containing each
+  point, as in the earlier 1.0.0 builds.
+  At a NoData boundary it uses the containing cell, with an estimate only if
+  that cell itself has NoData.
+- `--dtm-fill-max-distance METRES` defaults to `5`. When a point falls in a
+  NoData cell, the tool estimates its ground elevation from the closest
+  original finite cell centre, averaging centres at the same distance. The
+  cap is the horizontal distance between cell centres in metres. A hole with
+  no finite centre within the cap under an inventoried point stops the run.
+- `--dtm-fill-max-distance 0` or `--dtm-fill-radius 0` restores strict mode,
+  which stops on missing terrain under an inventoried point.
+  `--dtm-fill-radius CELLS` optionally adds a smaller cap, computed from
+  the number of cells (1–16) times the smaller raster cell dimension.
+
+The run log names the terrain lookup. When the terrain lookup
+uses estimates it also logs the number of distinct NoData cells used and the
+largest distance to a supporting cell centre. The run metadata records the
+same values, and the manifest includes them when debug outputs are enabled.
+
 Fine-tuning controls retain upstream defaults,
 including a 0.3 m CSP voxel and one routing worker. CSP geometry features are
 computed only when a non-zero geometry weight requires them.
@@ -104,8 +152,9 @@ computed only when a non-zero geometry weight requires them.
 
 **Results:** `inventory.csv` and `inventory.parquet` (the same table, one row
 per tree, with the DBH runs, slices and crown hull embedded as JSON),
-`stand_summary.csv` and the DTM. Run records are written only with
-`--debug-outputs true`.
+`stand_summary.csv` and the DTM. Run records normally require
+`--debug-outputs true`. A run that uses terrain estimates also writes
+`run_metadata.json` with its fill statistics.
 
 | File | One row per | Written |
 | --- | --- | --- |
@@ -115,7 +164,8 @@ per tree, with the DBH runs, slices and crown hull embedded as JSON),
 | `segmented_csp.laz` | point (every input dimension plus `PredInstance_CSP`) | only with `--enable-csp true` |
 | `effective_seeds.tsv` | CSP seed | only with `--enable-csp true --debug-outputs true`; the seeds are also in the inventory |
 | `manifest.json` | artifact keys and formats, fields and units, coordinate reference, segmentations, DTM | only with `--debug-outputs true` |
-| `run_metadata.json`, `resource_summary.json` | run settings, timings and memory | only with `--debug-outputs true` |
+| `run_metadata.json` | terrain fill statistics, plus settings and timings in debug mode | with `--debug-outputs true` or when a terrain estimate is used |
+| `resource_summary.json` | run timings and memory | only with `--debug-outputs true` |
 | `instance_index.json` | instance index | only with `--debug-outputs true` and the `copc-owned` reader |
 
 **Row order.** Rows are sorted by `(instance_dimension, instance_id)`; strings
@@ -124,9 +174,11 @@ sort in C (byte) order, so `PredInstance_FM` comes before `PredInstance_SAT`.
 statistics, snappy-compressed (no zstd), so a reader fetches one tree by reading
 only the row group that covers it, and only the columns it needs.
 
-**Coordinates.** `x`, `y`, `z`, the slice circles and the crown hulls are in
-the source CRS, named in the `crs` column of `stand_summary.csv` (for example
-`EPSG:2056`); `longitude`/`latitude` are WGS84.
+**Coordinates.** `x`, `y`, `z`, slice circles and crown hulls use the cloud's
+source frame. For projected clouds, `stand_summary.csv` shows the CRS and
+`longitude` and `latitude` use WGS84. For local clouds the label is
+`local (assumed metres)` or `local (EPSG:4978 stand-in)` and both geographic
+columns are blank in CSV and null in Parquet.
 
 **Types.** In `inventory.csv` (`data.table::fwrite`, RFC 4180 quoting), `NA` is
 an empty field, booleans are `TRUE`/`FALSE` and doubles are printed to 15
@@ -145,7 +197,7 @@ Units are also listed per field in `manifest.json`.
 | `instance_id` | | Tree ID in that dimension |
 | `x`, `y`, `z` | m (source CRS) | Tree position from the DBH measurement; median x/y and lowest z of the tree's grid points when no DBH was measured |
 | `seed_x`, `seed_y`, `seed_height_m` | m (source CRS; height above terrain) | CSP rows only: the seed the tree grew from; the same X, Y and Z a `--seed-file` takes |
-| `longitude`, `latitude` | degree (WGS84) | `x`, `y` transformed to EPSG:4326 |
+| `longitude`, `latitude` | degree (WGS84) | Projected `x`, `y` transformed to EPSG:4326, empty for local coordinates |
 | `dbh_m` | m | Diameter at breast height (median of the DBH runs); null when unavailable |
 | `height_m` | m | Tree height above the DTM |
 | `convex_hull_area_m2` | m² | Crown convex-hull area |
@@ -187,7 +239,7 @@ One row per segmentation: `segmentation_source`, `instance_dimension`,
 tree has a DBH), `mean_dbh_m`, `median_dbh_m`, `dbh_p05_m`, `dbh_p25_m`,
 `dbh_p75_m`, `dbh_p95_m`, `mean_height_m`, `median_height_m`, `height_p05_m`,
 `height_p25_m`, `height_p75_m`, `height_p95_m` (m), and `crs`, the source CRS of
-all coordinates (`EPSG:<code>`, or WKT when the CRS has no EPSG code).
+all coordinates (`EPSG:<code>`, projected WKT, or the local frame label).
 
 If species predictions are present, `--species-lookup lookup.tsv` can add names
 and taxonomy/model versions. The lookup needs `segmentation_source`,

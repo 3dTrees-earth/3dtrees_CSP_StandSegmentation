@@ -6,7 +6,8 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
                 length(files) == 1L) {
     point_cloud_bounds_python(files[[1L]], work_dir)
   } else point_cloud_bounds(files)
-  validate_inventory_crs(bounds$crs)
+  validate_inventory_crs(bounds$crs, bounds)
+  warn_unused_dtm_crs_override(config, bounds$crs)
   available <- unique(c(
     "X", "Y", "Z",
     if (is.null(bounds$available_dimensions)) names(inventory_standard_attributes),
@@ -24,8 +25,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
   dtm_started <- Sys.time()
   dtm_result <- make_inventory_dtm(files, bounds, config, work_dir, stage_dir)
   if (!is.null(aoi)) {
-    aoi_dtm <- terra::mask(terra::crop(dtm_result$dtm, terra::vect(aoi)), terra::vect(aoi))
-    write_geotiff(aoi_dtm, file.path(stage_dir, "dtm_aoi.tif"))
+    write_aoi_dtm(dtm_result$dtm, aoi, file.path(stage_dir, "dtm_aoi.tif"), local_inventory_crs(las_crs))
   }
   dtm_elapsed_seconds <- as.numeric(difftime(Sys.time(), dtm_started, units = "secs"))
   message(sprintf("CSP workflow: DTM ready in %.1f s; preparing inventory reader", dtm_elapsed_seconds))
@@ -38,6 +38,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
   inventory_started <- Sys.time()
   measured <- prepared$measure(dtm_result$dtm, aoi)
   inventories <- measured$inventories
+  dtm_result <- record_inventory_terrain_fills(dtm_result, attr(inventories, "terrain_fills"))
   inventory_elapsed_seconds <- as.numeric(difftime(Sys.time(), inventory_started, units = "secs"))
   message(sprintf("CSP workflow: inventory ready in %.1f s; exporting", inventory_elapsed_seconds))
   export_started <- Sys.time()
@@ -72,7 +73,7 @@ run_chunked_inventory <- function(config, files, stage_dir, output_parent, start
     random_seed = config$random_seed, routing_workers = config$routing_workers,
     geometry_threads = config$geometry_threads, voxel_resolution_m = config$voxel_resolution
   ), prepared$metadata, measured$metadata)
-  write_debug_json(config, metadata, file.path(stage_dir, "run_metadata.json"))
+  write_inventory_run_metadata(config, metadata, dtm_result, stage_dir)
   completed <- Sys.time()
   resources <- list(
     elapsed_seconds = as.numeric(difftime(completed, started, units = "secs")),

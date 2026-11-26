@@ -1,12 +1,61 @@
 inventory_schema_version <- "1.0.0"
 
-validate_inventory_crs <- function(crs) {
-  if (is.na(crs)) abort("Point cloud CRS is missing; metric inventory output needs a valid CRS")
+# LAS WKT and GeoTIFF may carry WGS 84 geocentric without the top-level EPSG ID.
+is_inventory_standin <- function(crs) {
+  isTRUE(crs$epsg == 4978L) ||
+    (!is.na(crs) && identical(crs$proj4string, sf::st_crs(4978)$proj4string))
+}
+
+local_inventory_crs <- function(crs) is.na(crs) || is_inventory_standin(crs)
+
+same_local_inventory_crs <- function(source_crs, raster_crs) {
+  (is.na(source_crs) && is.na(raster_crs)) ||
+    (is_inventory_standin(source_crs) && is_inventory_standin(raster_crs))
+}
+
+near_geocentric_origin <- function(bounds) {
+  xyz <- unlist(bounds[c("xmin", "xmax", "ymin", "ymax", "zmin", "zmax")], use.names = FALSE)
+  if (length(xyz) != 6L || any(!is.finite(xyz))) return(FALSE)
+  farthest <- apply(matrix(abs(xyz), nrow = 2L), 2L, max)
+  sum(farthest^2) < 6000000^2
+}
+
+validate_inventory_crs <- function(crs, bounds) {
+  if (is.na(crs)) {
+    xy_spans <- c(bounds$xmax - bounds$xmin, bounds$ymax - bounds$ymin)
+    if (max(xy_spans) < 1) {
+      abort("Point cloud has no CRS and spans less than one unit in both X and Y; supply a verified projected metre CRS")
+    }
+    if (max(abs(c(bounds$zmin, bounds$zmax))) > 10000 || bounds$zmax - bounds$zmin > 10000) {
+      abort("Point cloud has no CRS and elevations or elevation range exceed 10,000 units; supply a verified projected metre CRS")
+    }
+    centre <- c(mean(c(bounds$xmin, bounds$xmax)), mean(c(bounds$ymin, bounds$ymax)),
+                mean(c(bounds$zmin, bounds$zmax)))
+    radius <- sqrt(sum(centre^2))
+    # A UTM northing can sit inside the ECEF radius band. The elevation
+    # check above catches ECEF away from the equator. Near the equator,
+    # prefer a plausible UTM frame when the coordinates are ambiguous.
+    utm_like <- centre[[1L]] >= 0 && centre[[1L]] <= 1000000 && centre[[2L]] >= 0
+    if (!utm_like && radius >= 6350000 && radius <= 6400000) {
+      abort("Point cloud has no CRS and its coordinates resemble geocentric (ECEF) coordinates; supply a verified projected metre CRS")
+    }
+    return(invisible(crs))
+  }
+  if (is_inventory_standin(crs) && near_geocentric_origin(bounds)) return(invisible(crs))
+  if (is_inventory_standin(crs) || is_geocentric_wkt(crs$wkt)) {
+    abort("Point cloud has a geocentric CRS; only local EPSG:4978 stand-ins are supported")
+  }
   if (isTRUE(sf::st_is_longlat(crs)) ||
       !tolower(crs$units_gdal %||% "") %in% c("metre", "meter", "metres", "meters")) {
     abort("Point cloud CRS must be projected with metre units")
   }
   invisible(crs)
+}
+
+inventory_crs_label <- function(crs) {
+  if (is.na(crs)) return("local (assumed metres)")
+  if (is_inventory_standin(crs)) return("local (EPSG:4978 stand-in)")
+  if (is.na(crs$epsg)) crs$wkt else sprintf("EPSG:%d", crs$epsg)
 }
 
 `%||%` <- function(left, right) if (is.null(left) || is.na(left)) right else left
@@ -16,6 +65,10 @@ with_geographic_coordinates <- function(inventory, crs) {
   if (!all(c("x", "y", "z") %in% names(result))) abort("Inventory lacks source x, y, or z coordinates")
   if (any(!is.finite(result$x) | !is.finite(result$y) | !is.finite(result$z))) {
     abort("Inventory contains non-finite source coordinates")
+  }
+  if (local_inventory_crs(crs)) {
+    result[, `:=`(longitude = NA_real_, latitude = NA_real_)]
+    return(result)
   }
   geo <- sf::st_as_sf(as.data.frame(result), coords = c("x", "y"), crs = crs)
   transformed <- sf::st_transform(geo, 4326)
@@ -74,7 +127,6 @@ evidence_columns <- c("dbh_fits", "dbh_slices", "crown_hull")
 # reads only for an opened tree. stand_summary.csv holds one row per
 # segmentation and the CRS of every coordinate.
 write_outputs <- function(inventories, area, stage_dir, config, crs) {
-  validate_inventory_crs(crs)
   lookup <- read_species_lookup(config$species_lookup)
   inventories <- lapply(inventories, function(inventory) {
     attach_species_metadata(with_geographic_coordinates(inventory, crs), lookup)
@@ -92,7 +144,7 @@ write_outputs <- function(inventories, area, stage_dir, config, crs) {
   sorted_by <- sort_by_instance(inventory)
   summary <- data.table::rbindlist(lapply(inventories, stand_summary_for_inventory, area = area), fill = TRUE)
   sort_by_instance(summary)
-  summary[, crs := if (is.na(crs$epsg)) crs$wkt else sprintf("EPSG:%d", crs$epsg)]
+  summary[, crs := inventory_crs_label(crs)]
   write_csv_table(inventory, file.path(stage_dir, "inventory.csv"))
   write_parquet_table(inventory, file.path(stage_dir, "inventory.parquet"))
   write_csv_table(summary, file.path(stage_dir, "stand_summary.csv"))
@@ -106,11 +158,22 @@ write_outputs <- function(inventories, area, stage_dir, config, crs) {
        artifacts = artifacts)
 }
 
-# Run records (settings, timings, audits) only with --debug-outputs true.
+# Detailed settings, timings and audits require --debug-outputs true.
 write_debug_json <- function(config, value, path) {
   if (isTRUE(config$debug_outputs)) {
     jsonlite::write_json(value, path, auto_unbox = TRUE, pretty = TRUE, na = "null")
   }
+}
+
+write_inventory_run_metadata <- function(config, metadata, dtm, stage_dir) {
+  debug <- isTRUE(config$debug_outputs)
+  if (!debug && dtm$filled_cells == 0L) return(invisible(NULL))
+  terrain <- inventory_terrain_metadata(config, dtm)
+  prefix <- names(terrain) != "terrain_lookup"
+  names(terrain)[prefix] <- paste0("dtm_", names(terrain)[prefix])
+  fields <- if (debug) c(metadata, terrain) else terrain
+  jsonlite::write_json(fields, file.path(stage_dir, "run_metadata.json"), auto_unbox = TRUE,
+                       pretty = TRUE, digits = NA, na = "null")
 }
 
 manifest_scalar <- function(value) {
@@ -122,16 +185,18 @@ validate_inventory_manifest <- function(manifest, stage_dir, expected_dimensions
     abort("Inventory manifest schema version is invalid")
   }
   coordinates <- manifest$coordinate_reference
-  if (!manifest_scalar(coordinates$source_wkt) ||
+  local <- identical(coordinates$source_frame, "local")
+  source_crs <- sf::st_crs(coordinates$source_wkt %||% NA_character_)
+  if (local != local_inventory_crs(source_crs) ||
       !identical(coordinates$source_xy_units, "m") ||
       !identical(coordinates$source_z_units, "m") ||
       !identical(coordinates$longitude_field, "longitude") ||
       !identical(coordinates$latitude_field, "latitude") ||
-      !identical(as.integer(coordinates$wgs84_epsg), 4326L)) {
+      !(if (local) is.null(coordinates$wgs84_epsg) else
+          identical(as.integer(coordinates$wgs84_epsg), 4326L))) {
     abort("Inventory manifest has unsafe coordinate metadata")
   }
-  source_crs <- sf::st_crs(coordinates$source_wkt)
-  validate_inventory_crs(source_crs)
+  if (!local) validate_inventory_crs(source_crs, NULL)
   if (!is.null(coordinates$source_epsg) &&
       (length(coordinates$source_epsg) != 1L ||
        (!is.na(coordinates$source_epsg) && source_crs != sf::st_crs(coordinates$source_epsg)))) {
@@ -159,12 +224,14 @@ validate_inventory_manifest <- function(manifest, stage_dir, expected_dimensions
     abort("Inventory manifest segmentation dimensions do not match the outputs")
   }
   raster <- manifest$dtm
-  dtm_raster <- terra::rast(file.path(stage_dir, "dtm_full.tif"))
+  dtm_raster <- terra::rast(file.path(stage_dir, "dtm_full.tif"), guessCRS = FALSE)
   dtm_bounds <- list(xmin = terra::xmin(dtm_raster), xmax = terra::xmax(dtm_raster),
                      ymin = terra::ymin(dtm_raster), ymax = terra::ymax(dtm_raster))
+  raster_crs <- sf::st_crs(if (nzchar(raster$crs_wkt %||% "")) raster$crs_wkt else NA_character_)
+  matching_crs <- if (local) same_local_inventory_crs(source_crs, raster_crs) else
+    same_horizontal_crs(source_crs, raster_crs, dtm_bounds)
   if (!identical(raster$key, "dtm_full.tif") || !manifest_scalar(raster$source) ||
-      !manifest_scalar(raster$crs_wkt) ||
-      !same_horizontal_crs(source_crs, sf::st_crs(raster$crs_wkt), dtm_bounds) ||
+      !matching_crs ||
       length(raster$resolution_m) != 2L || any(!is.finite(raster$resolution_m)) ||
       any(raster$resolution_m <= 0)) {
     abort("Inventory manifest DTM metadata is invalid")
@@ -182,7 +249,6 @@ validate_inventory_manifest <- function(manifest, stage_dir, expected_dimensions
 }
 
 write_inventory_manifest <- function(exports, config, crs, dtm, stage_dir) {
-  validate_inventory_crs(crs)
   specs <- lapply(exports$inventories, function(inventory) {
     list(
       technical_name = unique(inventory$instance_dimension),
@@ -196,30 +262,34 @@ write_inventory_manifest <- function(exports, config, crs, dtm, stage_dir) {
       fields = output_field_units(names(inventory))
     )
   })
-  raster <- terra::rast(file.path(stage_dir, "dtm_full.tif"))
+  raster <- terra::rast(file.path(stage_dir, "dtm_full.tif"), guessCRS = FALSE)
+  terrain <- inventory_terrain_metadata(config, dtm)
   manifest <- list(
     schema_version = inventory_schema_version,
     generated_at = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
     coordinate_reference = list(
       source_epsg = crs$epsg, source_wkt = crs$wkt,
       source_xy_units = "m", source_z_units = "m",
-      longitude_field = "longitude", latitude_field = "latitude", wgs84_epsg = 4326L
+      longitude_field = "longitude", latitude_field = "latitude",
+      wgs84_epsg = if (!local_inventory_crs(crs)) 4326L
     ),
     segmentations = unname(specs),
     tables = lapply(exports$tables, function(table) list(fields = output_field_units(names(table)))),
-    dtm = list(key = "dtm_full.tif", source = dtm$method,
-               crs_wkt = terra::crs(raster), resolution_m = as.numeric(terra::res(raster)),
-               aoi_key = if (file.exists(file.path(stage_dir, "dtm_aoi.tif"))) "dtm_aoi.tif" else NULL),
+    dtm = c(list(key = "dtm_full.tif", source = dtm$method,
+                 crs_wkt = terra::crs(raster), resolution_m = as.numeric(terra::res(raster)),
+                 aoi_key = if (file.exists(file.path(stage_dir, "dtm_aoi.tif"))) "dtm_aoi.tif" else NULL),
+            terrain),
     artifacts = c(exports$artifacts, list(list(key = "dtm_full.tif", format = "geotiff")),
                   lapply(intersect(c("dtm_aoi.tif", "effective_seeds.tsv", "segmented_csp.laz", "instance_index.json",
                                      "run_metadata.json", "resource_summary.json"), list.files(stage_dir)),
                          function(key) list(key = key, format = tools::file_ext(key))))
   )
+  if (local_inventory_crs(crs)) manifest$coordinate_reference$source_frame <- "local"
   expected_dimensions <- vapply(exports$inventories, function(inventory) unique(inventory$instance_dimension), character(1))
   validate_inventory_manifest(manifest, stage_dir, expected_dimensions)
   if (isTRUE(config$debug_outputs)) {
     jsonlite::write_json(manifest, file.path(stage_dir, "manifest.json"), auto_unbox = TRUE,
-                         pretty = TRUE, na = "null", null = "null")
+                         pretty = TRUE, digits = NA, na = "null", null = "null")
   }
   invisible(manifest)
 }

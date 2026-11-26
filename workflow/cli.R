@@ -127,6 +127,10 @@ usage <- function() {
     "  --seed-file TSV                    X/Y/Z/TreeID table for supplied seeds",
     "  --aoi-json GEOJSON                 Optional AOI in the point-cloud CRS",
     "  --dtm GEOTIFF                      Use this DTM; otherwise generate one",
+    "  --dtm-crs-local-ok true|false      Treat a projected metre DTM as already in the local cloud frame (default: false)",
+    "  --dtm-lookup bilinear|nearest      Terrain sampling (default: bilinear)",
+    "  --dtm-fill-max-distance METRES    Fill NoData under points within this distance (default: 5, 0 disables)",
+    "  --dtm-fill-radius CELLS           Optional additional fill cap, 0–16 cells (0 disables fill)",
     "  --species-lookup TSV               Species names and taxonomy/model versions",
     "  --dtm-resolution METRES            DTM cell size (default: 0.2)",
     "  --read-chunk-size METRES            Spatial DTM/inventory tile size (default: 300)",
@@ -175,7 +179,8 @@ usage <- function() {
     "                                     every point; 0 measures every point (default: 0.01)",
     "  --dbh-evidence true|false          Fill dbh_fits, dbh_slices and crown_hull (default: true)",
     "  --debug-outputs true|false         Also write manifest.json, run_metadata.json,",
-    "                                     resource_summary.json and instance_index.json (default: false)",
+    "                                     resource_summary.json and instance_index.json (default: false).",
+    "                                     Terrain fills always record statistics in run_metadata.json.",
     "  --scratch-dir DIR                  Intermediate files (default: $TMPDIR, else next to output)",
     sep = "\n"
   )
@@ -192,6 +197,10 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     seed_file = NULL,
     aoi_json = NULL,
     dtm = NULL,
+    dtm_crs_local_ok = FALSE,
+    dtm_lookup = "bilinear",
+    dtm_fill_radius = NULL,
+    dtm_fill_max_distance = 5,
     species_lookup = NULL,
     dtm_resolution = 0.2,
     read_chunk_size = 300,
@@ -275,6 +284,10 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
     else if (key == "--seed-file") config$seed_file <- value
     else if (key == "--aoi-json") config$aoi_json <- value
     else if (key == "--dtm") config$dtm <- value
+    else if (key == "--dtm-crs-local-ok") config$dtm_crs_local_ok <- parse_bool(value, key)
+    else if (key == "--dtm-lookup") config$dtm_lookup <- value
+    else if (key == "--dtm-fill-max-distance") config$dtm_fill_max_distance <- parse_number(value, key, 0)
+    else if (key == "--dtm-fill-radius") config$dtm_fill_radius <- parse_number(value, key, 0, 16, TRUE)
     else if (key == "--species-lookup") config$species_lookup <- value
     else if (key == "--dtm-resolution") config$dtm_resolution <- parse_number(value, key, 0.001)
     else if (key == "--read-chunk-size") config$read_chunk_size <- parse_number(value, key, 1)
@@ -321,6 +334,8 @@ parse_cli_args <- function(args = commandArgs(trailingOnly = TRUE)) {
 
   if (is.null(config$input)) abort("--input is required")
   if (is.null(config$output_dir)) abort("--output-dir is required")
+  if (!config$dtm_lookup %in% c("nearest", "bilinear")) abort("--dtm-lookup must be nearest or bilinear")
+  if (!is.finite(config$dtm_fill_max_distance)) abort("--dtm-fill-max-distance must be finite")
   if (!config$dtm_strategy %in% c("auto", "spatial", "streaming")) {
     abort("--dtm-strategy must be auto, spatial, or streaming")
   }

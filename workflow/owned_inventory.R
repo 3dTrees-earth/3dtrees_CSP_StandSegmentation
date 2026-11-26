@@ -54,7 +54,9 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
   ids <- sprintf("%.0f", as.numeric(unlist(plan$ids)))
   expected <- stats::setNames(as.numeric(unlist(plan$counts)), ids)
   observed <- stats::setNames(numeric(length(ids)), ids)
-  trees <- stats::setNames(replicate(length(ids), new_tree(tree_frame(config, dtm)), simplify = FALSE), ids)
+  fill <- new_terrain_fill(dtm, config)
+  frame <- tree_frame(config, dtm, fill)
+  trees <- stats::setNames(replicate(length(ids), new_tree(frame), simplify = FALSE), ids)
   if (is.null(audit_path)) audit_path <- file.path(stream$work_dir, sprintf("owned_%s_%06d.json", spec$source, window_index))
   log_path <- paste0(audit_path, ".log")
   command <- owned_reader_command(config, c(
@@ -69,7 +71,7 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
     if (length(values) %% length(columns)) abort("Truncated owned COPC point stream")
     points <- data.table::as.data.table(matrix(values, ncol = length(columns), byrow = TRUE,
                                                dimnames = list(NULL, columns)))
-    points <- normalize_inventory_points(points, dtm)
+    points <- normalize_inventory_points(points, dtm, config$dtm_lookup, fill)
     for (id in unique(points[[spec$instance]])) {
       key <- sprintf("%.0f", id)
       if (!key %in% ids) abort("COPC reader emitted an instance owned by another core")
@@ -102,7 +104,7 @@ read_owned_window <- function(stream, layout, plan, window_index, dtm, config, a
   audit$r_observed_counts <- as.list(unname(observed))
   audit$r_peak_rss_kb <- process_peak_rss_kb()
   list(inventory = data.table::rbindlist(results, use.names = TRUE, fill = TRUE), audit = audit,
-       instance_ids = ids, observed_counts = unname(observed))
+       instance_ids = ids, observed_counts = unname(observed), terrain_fills = terrain_fill_distances(fill))
 }
 
 # Largest instances first: balance point work, while never splitting one ID.
@@ -126,10 +128,30 @@ owned_worker_groups <- function(plan, workers) {
   })
 }
 
+abort_owned_worker <- function(worker, detail = NULL, dispatcher = NULL) {
+  failure <- if (is.null(detail)) {
+    "exited without a result (it may have been killed, for example by an out-of-memory limit)"
+  } else paste("reported an R error:", detail)
+  diagnostic <- sprintf("Owned %s worker %s", worker, failure)
+  suffix <- "; no inventory published"
+  if (!grepl(suffix, diagnostic, fixed = TRUE)) diagnostic <- paste0(diagnostic, suffix)
+  if (!is.null(dispatcher)) diagnostic <- paste(diagnostic, dispatcher, sep = "\n")
+  abort(diagnostic)
+}
+
+check_owned_worker <- function(result, worker) {
+  if (is.null(result)) abort_owned_worker(worker)
+  if (inherits(result, "try-error")) {
+    error <- attr(result, "condition")
+    abort_owned_worker(worker, if (is.null(error)) as.character(result) else conditionMessage(error))
+  }
+}
+
 read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_path, config, aoi, crs) {
   groups <- owned_worker_groups(plan, config$inventory_workers)
   if (length(groups) == 1L) {
-    result <- read_owned_window(stream, layout, plan, window_index, terra::rast(dtm_path), config, aoi, crs)
+    dtm <- terra::rast(dtm_path, guessCRS = FALSE)
+    result <- read_owned_window(stream, layout, plan, window_index, dtm, config, aoi, crs)
     result$audit$worker_count <- 1L
     return(result)
   }
@@ -139,6 +161,7 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
   config$core_tokens <- file.path(pipe_dir, "cores")
   dir.create(config$core_tokens)
   paths <- file.path(pipe_dir, sprintf("worker-%02d.fifo", seq_along(groups)))
+  error_paths <- file.path(pipe_dir, sprintf("worker-%02d.error", seq_along(groups)))
   if (system2("mkfifo", c("-m", "600", vapply(paths, shQuote, character(1)))) != 0L) {
     abort("Cannot create owned worker memory pipes")
   }
@@ -156,7 +179,7 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
     }
   }, add = TRUE)
   for (i in seq_along(groups)) {
-    jobs[[i]] <- parallel::mcparallel({
+    jobs[[i]] <- parallel::mcparallel(withCallingHandlers({
       lidR::set_lidr_threads(1L)
       data.table::setDTthreads(1L)
       # fifo() exposes short OS reads (often 8 KiB), which both fragments
@@ -164,11 +187,15 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
       # buffered file connection uses fread to fill readBin's requested batch.
       connection <- file(paths[[i]], open = "rb", raw = TRUE)
       result <- read_owned_window(stream, layout, groups[[i]], window_index,
-                                  terra::rast(dtm_path), config, aoi, crs,
+                                  terra::rast(dtm_path, guessCRS = FALSE), config, aoi, crs,
                                   connection = connection, audit_path = audit_path)
       hand_back_core(config$core_tokens)
       result
-    }, mc.set.seed = FALSE)
+    }, error = function(error) {
+      # Save the R error before unwinding closes the FIFO and the dispatcher
+      # can see a broken pipe. The worker still returns its normal try-error.
+      try(writeLines(conditionMessage(error), error_paths[[i]]), silent = TRUE)
+    }), mc.set.seed = FALSE)
   }
   command <- owned_reader_command(config, c(
     "dispatch", "--config", stream$owned_config, "--index", stream$owned_index_path,
@@ -176,12 +203,31 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
     "--groups", group_path, "--audit", audit_path))
   status <- system(paste(command, ">", shQuote(log_path), "2>&1"))
   if (status != 0L) {
-    abort(paste("Owned COPC dispatcher failed:", paste(tail(readLines(log_path, warn = FALSE), 20L), collapse = "\n")))
+    log_tail <- tail(readLines(log_path, warn = FALSE), 20L)
+    reason <- sprintf("exit status %d", status)
+    # The shell reports a signalled dispatcher as 128 plus its signal number.
+    if (status == 137L) {
+      reason <- paste0(reason, ", killed by signal 9 (possible out-of-memory kill)")
+    } else if (status > 128L && status <= 192L) {
+      reason <- sprintf("%s, terminated by signal %d", reason, status - 128L)
+    }
+    dispatcher <- paste(c(sprintf("Owned COPC dispatcher failed (%s):", reason), log_tail),
+                        collapse = "\n")
+    # A broken pipe points to a stopped consumer. Other dispatcher failures
+    # cause worker EOF errors, which must not replace the dispatcher cause.
+    if (any(grepl("^BrokenPipeError:", log_tail))) {
+      diagnostics <- error_paths[file.exists(error_paths)]
+      detail <- if (length(diagnostics)) {
+        paste(readLines(diagnostics[[1L]], warn = FALSE), collapse = "\n")
+      }
+      abort_owned_worker("instance", detail, dispatcher)
+    }
+    abort(dispatcher)
   }
   results <- parallel::mccollect(jobs)
   collected <- TRUE
-  failed <- vapply(results, function(x) is.null(x) || inherits(x, "try-error"), logical(1))
-  if (length(results) != length(groups) || any(failed)) abort("Owned instance worker failed; no inventory published")
+  for (result in results) check_owned_worker(result, "instance")
+  if (length(results) != length(groups)) abort_owned_worker("instance")
   ids <- unlist(lapply(results, `[[`, "instance_ids"), use.names = FALSE)
   counts <- unlist(lapply(results, `[[`, "observed_counts"), use.names = FALSE)
   expected_ids <- sprintf("%.0f", as.numeric(unlist(plan$ids)))
@@ -195,7 +241,7 @@ read_parallel_owned_window <- function(stream, layout, plan, window_index, dtm_p
     observed_counts = as.list(result$observed_counts),
     r_peak_rss_kb = result$audit$r_peak_rss_kb))
   list(inventory = data.table::rbindlist(lapply(results, `[[`, "inventory"), use.names = TRUE, fill = TRUE),
-       audit = audit)
+       audit = audit, terrain_fills = merge_terrain_fills(lapply(results, `[[`, "terrain_fills")))
 }
 
 # Bytes of memory per owned point held at once (grid trees, batches and
@@ -260,14 +306,17 @@ inventory_from_owned_windows <- function(stream, dtm, config, aoi, crs) {
   small_workers <- min(2L, slots)
   results <- vector("list", length(tasks))
   running <- list()
+  # Workers still using the shared scratch directory must finish before the
+  # caller removes it on error.
+  on.exit(if (length(running)) parallel::mccollect(lapply(running, `[[`, "job")), add = TRUE)
   next_task <- 1L
   collect <- function(wait) {
     done <- parallel::mccollect(lapply(running, `[[`, "job"), wait = wait, timeout = if (wait) 0 else 5)
     for (pid in names(done)) {
       entry <- Filter(function(item) identical(as.character(item$job$pid), pid), running)[[1L]]
-      if (is.null(done[[pid]]) || inherits(done[[pid]], "try-error")) abort("Owned window worker failed; no inventory published")
-      results[[entry$task]] <<- done[[pid]]
       running <<- Filter(function(item) !identical(as.character(item$job$pid), pid), running)
+      check_owned_worker(done[[pid]], "window")
+      results[[entry$task]] <<- done[[pid]]
     }
   }
   while (next_task <= length(tasks) || length(running)) {
@@ -306,6 +355,7 @@ inventory_from_owned_windows <- function(stream, dtm, config, aoi, crs) {
     inventories[[slug]] <- inventory
     audits[[slug]] <- lapply(mine, `[[`, "audit")
   }
+  attr(inventories, "terrain_fills") <- merge_terrain_fills(lapply(results, `[[`, "terrain_fills"))
   attr(inventories, "copc_audits") <- audits
   inventories
 }

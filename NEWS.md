@@ -1,3 +1,28 @@
+# CspStandSegmentation 1.0.0 (3Dtrees fork), second re-release
+
+- Inventory accepts unlabelled local coordinates with metre units assumed and
+  EPSG:4978 stand-ins within 6,000 km of the origin. Stand summaries show
+  `local (assumed metres)` or `local (EPSG:4978 stand-in)`, with blank longitude
+  and latitude. Geographic and genuine geocentric inputs are refused, as
+  are unlabelled bounds with suspicious spans or elevations and wrapped
+  stand-ins at or beyond 6,000 km. Empty WKT is treated as missing and the
+  sequential and owned readers reject non-finite or inverted Z bounds.
+- Local inventory accepts a matching unlabelled or stand-in DTM. A projected
+  metre DTM already in the local cloud frame requires `--dtm-crs-local-ok true`
+  (default `false`). Debug metadata records the original DTM CRS.
+- Terrain heights use bilinear interpolation of the DTM by default (`--dtm-lookup bilinear`); `--dtm-lookup nearest` gives the earlier 1.0.0 behaviour. Heights, stem bands and therefore DBH and height values change slightly against the earlier 1.0.0 builds (DBH counts −4 to +2 on five test plots).
+  NoData cells under points use the nearest finite terrain by default, up
+  to `--dtm-fill-max-distance 5` metres between cell centres. The run warns
+  and records the distinct cells used and the largest fill distance in
+  `run_metadata.json`, including runs without debug outputs. Published
+  rasters preserve the original elevations and NoData. Set
+  `--dtm-fill-radius 0` or `--dtm-fill-max-distance 0` for strict handling.
+- Generated DTM GeoTIFFs use the fixed band name `dtm`, changing file hashes
+  relative to 1.0.0 without changing values, CRS or extent.
+- COPC inventory reports the underlying R worker error, including missing
+  terrain under inventoried points, and reports when a worker exits without a
+  result.
+
 # CspStandSegmentation 1.0.0 (3Dtrees fork)
 
 ## Breaking changes
@@ -18,7 +43,7 @@
 -   Inventory memory: the 1 cm grid points are kept as the LAS integers (12 instead of 32 bytes per point), batches are collected in a list instead of copying a tree's grid each time, and heights above the terrain are looked up by DTM cell index instead of `terra::extract`, which needed about 1 GB per million points. Same results byte for byte; the 457 M-point crop needs 17.1 instead of 23.5 GiB and 13.3 instead of 15.3 min, the 2 B-point dataset 1887 26 instead of 30 GiB and 30 instead of 35 min at 10 cores.
 
 -   Inventory speed: a pool of COPC decoders reads each window (reading kept ~3.6 of 10 cores busy before, ~6 now); a tree with at least 2 M grid points computes its geometry and seeded fits on cores handed back by workers that have finished; each worker measures its largest trees first; windows of all segmentations run side by side while their memory, estimated from the index (32 bytes per owned point), fits `GALAXY_MEMORY_MB`, and a window needing more than half of it runs alone with all workers. A window that would need more than 80 % of `GALAXY_MEMORY_MB` is split into windows of whole trees, so peak memory follows the grant instead of the largest 50 m cell. The seeded DBH fits get only the points upstream measures (the stem band, the height and x/y extremes and the crown hull above 0.5 m, on the coordinates lidR quantizes) instead of a copy of the whole tree: the largest 1924 tree (22 M grid points) needs 5.5 instead of 13.5 GiB, or 30 GiB with five parallel fits, and is measured in 43 instead of 77 s. With a fixed 32 GB grant at 10 cores, 1924 (4.3 B points) peaks at 25 GiB, 1887 at 18 GiB and 2623 at 8 GiB. Same results byte for byte; with the DTM supplied at 10 cores 1887 takes 17 instead of 21 min, 1924 61 instead of 76 min, 2518 52 instead of 74 min.
--   Container: release tags also publish a Singularity image for Galaxy, built from the pushed Docker digest: `oras://ghcr.io/3dtrees-earth/3dtrees_csp_standsegmentation:<version>-sif`. Docker stays for local use.
+-   Container: one Docker image per release (`ghcr.io/3dtrees-earth/3dtrees_csp_standsegmentation:<version>`); Galaxy runs it under Singularity through its own Docker-to-Singularity conversion, as for 3Dtrees: Potree. No separate SIF image is published.
 -   Container: rlas is patched to report LAS headers of more than 2^31 points (`patches/rlas-64bit-point-count.patch`, as in the Raster tool), so lidR reads the header of large merged clouds.
 
 ## Bug fixes

@@ -76,7 +76,23 @@ dtm_config <- parse_cli_args(c(
   "--input", "merged.copc.laz", "--output-dir", "output",
   "--instance-attribute", "PredInstance_SAT", "--dtm", "terrain.tif"
 ))
-stopifnot(identical(dtm_config$dtm, "terrain.tif"))
+stopifnot(identical(dtm_config$dtm, "terrain.tif"), identical(dtm_config$dtm_lookup, "bilinear"),
+          is.null(dtm_config$dtm_fill_radius), identical(dtm_config$dtm_fill_max_distance, 5),
+          identical(dtm_config$dtm_crs_local_ok, FALSE))
+dtm_args <- c("--input", "merged.copc.laz", "--output-dir", "output",
+              "--instance-attribute", "PredInstance_SAT", "--dtm", "terrain.tif")
+opt_in <- parse_cli_args(c(dtm_args, "--dtm-crs-local-ok", "true", "--dtm-lookup", "bilinear",
+                           "--dtm-fill-radius", "16", "--dtm-fill-max-distance", "2.5"))
+stopifnot(isTRUE(opt_in$dtm_crs_local_ok), identical(opt_in$dtm_lookup, "bilinear"),
+          identical(opt_in$dtm_fill_radius, 16L), identical(opt_in$dtm_fill_max_distance, 2.5))
+expect_error(parse_cli_args(c(dtm_args, "--dtm-crs-local-ok", "maybe")), "dtm-crs-local-ok")
+expect_error(parse_cli_args(c(dtm_args, "--dtm-lookup", "cubic")), "dtm-lookup")
+for (radius in c("-1", "17", "1.5")) {
+  expect_error(parse_cli_args(c(dtm_args, "--dtm-fill-radius", radius)), "dtm-fill-radius")
+}
+for (distance in c("-1", "Inf", "NaN")) {
+  expect_error(parse_cli_args(c(dtm_args, "--dtm-fill-max-distance", distance)), "dtm-fill-max-distance")
+}
 # The result files are fixed: there is no format choice any more.
 expect_error(parse_cli_args(c("--input", "input.laz", "--output-dir", "output",
                               "--instance-attribute", "PredInstance_SAT", "--output-formats", "csv")),
@@ -231,8 +247,7 @@ expect_error(parse_cli_args(c(index_args, "--inventory-index-queue-mb", "31")), 
 copc <- file.path(root, "tests", "tool", "fixtures", "multi-instance.copc.laz")
 plain_dir <- tempfile("csp-plain-laz-")
 dir.create(plain_dir)
-plain <- file.path(plain_dir, "plain.laz")
-lidR::writeLAS(suppressWarnings(lidR::readLAS(copc, select = "xyz")), plain)
+plain <- file.path(root, "inst", "extdata", "beech.las")
 stopifnot(input_is_copc(copc), !input_is_copc(plain))
 auto <- parse_cli_args(c("--input", copc, "--output-dir", "out", "--instance-attribute", "PredInstance_FM"))
 owned <- resolve_inventory_read_mode(auto, copc)

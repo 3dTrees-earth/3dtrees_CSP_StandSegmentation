@@ -45,9 +45,14 @@ specifications <- c(
 )
 dimensions <- c(SAT = "PredInstance_SAT", FM = "PredInstance_FM", ULS = "PredInstance_ULS")
 
-# The same points as a plain (non-COPC) LAZ, as most platform inputs arrive.
+# Make a plain LAZ from the original LAS used to build the COPC fixture.
 plain_input <- file.path(work, "multi-instance.laz")
-lidR::writeLAS(cloud, plain_input)
+wkt_path <- file.path(work, "plain.wkt")
+writeLines(sf::st_crs(32632)$wkt, wkt_path)
+fixture_script <- file.path(root, "tests/tool/generate_multi_instance_copc.py")
+original_las <- file.path(root, "inst/extdata/beech.las")
+stopifnot(system2("python3", shQuote(c(fixture_script, original_las, plain_input,
+                                       "--plain-wkt", wkt_path))) == 0L)
 stopifnot(!input_is_copc(plain_input), input_is_copc(input))
 
 # NULL leaves the reader at its default (auto).
@@ -60,13 +65,15 @@ run_case <- function(label, mode, csp = FALSE, chunk_size = 300,
             "--species-lookup", lookup_path,
             "--read-chunk-size", as.character(chunk_size),
             if (!is.null(inventory_read_mode)) c("--inventory-read-mode", inventory_read_mode),
-            "--dtm-workers", "1", "--debug-outputs", "true")
+            "--dtm-workers", "1", "--dtm-crs-local-ok", "true", "--debug-outputs", "true")
   if (mode == "supplied") args <- c(args, "--dtm", dtm_path)
   if (csp) args <- c(args, "--enable-csp", "true")
   status <- suppressWarnings(system2("Rscript", args, stdout = log, stderr = log))
   if (!identical(status, 0L)) {
     stop(sprintf("%s failed:\n%s", label, paste(readLines(log, warn = FALSE), collapse = "\n")))
   }
+  logs <- readLines(log, warn = FALSE)
+  stopifnot("WARNING: --dtm-crs-local-ok has no effect for a projected point cloud" %in% logs)
   output
 }
 
@@ -161,14 +168,14 @@ cat("passed supplied (spatial reader)\n")
 
 # Both readers must feed the same point order into the serial inventory so
 # the bounded scan cannot change stochastic DBH measurements.
-sequential <- run_case("supplied-laz", "supplied", chunk_size = 10, source = plain_input)
+sequential <- run_case("supplied-sequential", "supplied", chunk_size = 10, inventory_read_mode = "sequential")
 check_case(sequential, "supplied", read_mode = "sequential_scan_and_instance_partitions")
 sequential_metadata <- jsonlite::fromJSON(file.path(sequential, "run_metadata.json"))
 stopifnot(sequential_metadata$read_chunk_size_m == 10,
           sequential_metadata$spatial_bucket_count > 0)
 stopifnot(identical(unname(tools::md5sum(file.path(spatial, "inventory.csv"))),
                     unname(tools::md5sum(file.path(sequential, "inventory.csv")))))
-cat("passed supplied-laz (auto: sequential reader, same inventory as spatial)\n")
+cat("passed supplied-sequential (same COPC inventory as spatial)\n")
 
 output <- run_case("generated", "generated")
 check_case(output, "generated", read_mode = "copc_owned_windows")

@@ -170,17 +170,118 @@ failure_stream <- stream
 failure_stream$work_dir <- file.path(work, "failed-consumer")
 dir.create(failure_stream$work_dir)
 bad_dtm <- terra::rast(dtm_path)
-terra::values(bad_dtm) <- NA_real_
+tree_point <- which(cloud$PredInstance_FM > 0)[[1L]]
+bad_cell <- terra::cellFromXY(bad_dtm, cbind(cloud$X[tree_point], cloud$Y[tree_point]))
+bad_values <- terra::values(bad_dtm, mat = FALSE)
+bad_values[bad_cell] <- NA_real_
+terra::values(bad_dtm) <- bad_values
 bad_dtm_path <- file.path(work, "bad-dtm.tif")
 terra::writeRaster(bad_dtm, bad_dtm_path)
 error <- tryCatch({
   suppressWarnings(read_parallel_owned_window(failure_stream, stream$layouts[[1L]],
     stream$owned_index$layouts[[1L]]$windows[[1L]], 1L, bad_dtm_path,
-    config, NULL, sf::st_crs(cloud)))
+    modifyList(config, list(dtm_fill_radius = 0L)), NULL, sf::st_crs(cloud)))
   NULL
 }, error = conditionMessage)
-stopifnot(!is.null(error), grepl("worker failed|dispatcher failed", error),
+nodata_message <- "DTM has missing or non-finite cells under inventoried points"
+stopifnot(!is.null(error), grepl("instance worker reported an R error", error, fixed = TRUE),
+          grepl(nodata_message, error, fixed = TRUE),
           !length(list.files(failure_stream$work_dir, pattern = "owned-pipes", all.files = TRUE)))
+
+failed_config <- config
+failed_config$dtm <- bad_dtm_path
+failed_config$dtm_fill_radius <- 0L
+failed_config$inventory_workers <- 4L  # fork concurrent windows as well as instance workers
+failed_config$output_dir <- file.path(work, "failed-nodata")
+prior_memory <- Sys.getenv("GALAXY_MEMORY_MB", unset = NA_character_)
+Sys.setenv(GALAXY_MEMORY_MB = "8192")
+error <- tryCatch({ run_tool(failed_config); "" }, error = conditionMessage, finally = {
+  if (is.na(prior_memory)) Sys.unsetenv("GALAXY_MEMORY_MB")
+  else Sys.setenv(GALAXY_MEMORY_MB = prior_memory)
+})
+stopifnot(grepl("window worker reported an R error", error, fixed = TRUE),
+          grepl(nodata_message, error, fixed = TRUE), !dir.exists(failed_config$output_dir),
+          length(regmatches(error, gregexpr("; no inventory published", error, fixed = TRUE))[[1L]]) == 1L)
+
+# Exercise the real parent and FIFO workers with a dispatcher that writes a
+# partial record before failing. Worker EOF errors must preserve the cause.
+dispatcher_probe <- file.path(work, "fail-dispatch.py")
+writeLines(c(
+  "import json, os, signal, struct, sys, time",
+  "from contextlib import ExitStack",
+  "from pathlib import Path",
+  "mode, group_path = sys.argv[1:]",
+  "with ExitStack() as stack:",
+  "    groups = json.loads(Path(group_path).read_text())",
+  "    for group in groups:",
+  "        pipe = stack.enter_context(open(group['pipe'], 'wb', buffering=0))",
+  "        pipe.write(struct.pack('<d', 0))",
+  "    if mode == 'kill':",
+  "        print('dispatcher probe before signal', file=sys.stderr, flush=True)",
+  "        os.kill(os.getpid(), signal.SIGKILL)",
+  "time.sleep(0.5)",
+  "raise RuntimeError('injected COPC decode error')"
+), dispatcher_probe)
+original_reader_command <- owned_reader_command
+for (mode in c("raise", "kill")) {
+  owned_reader_command <- function(config, arguments) {
+    if (arguments[[1L]] != "dispatch") return(original_reader_command(config, arguments))
+    groups <- arguments[[match("--groups", arguments) + 1L]]
+    paste("python3", shQuote(dispatcher_probe), shQuote(mode), shQuote(groups))
+  }
+  error <- tryCatch({
+    read_parallel_owned_window(failure_stream, stream$layouts[[1L]],
+      stream$owned_index$layouts[[1L]]$windows[[1L]], 1L, dtm_path,
+      config, NULL, sf::st_crs(cloud))
+    ""
+  }, error = conditionMessage)
+  expected <- if (mode == "raise") {
+    c("exit status 1", "Traceback", "RuntimeError: injected COPC decode error")
+  } else {
+    c("exit status 137", "signal 9", "out-of-memory", "dispatcher probe before signal")
+  }
+  stopifnot(grepl("Owned COPC dispatcher failed", error, fixed = TRUE),
+            all(vapply(expected, grepl, logical(1), x = error, fixed = TRUE)))
+}
+owned_reader_command <- original_reader_command
+
+killed <- parallel::mcparallel(tools::pskill(Sys.getpid(), signal = 9L))
+killed_result <- suppressWarnings(parallel::mccollect(killed))
+error <- tryCatch({ check_owned_worker(killed_result[[as.character(killed$pid)]], "window"); "" },
+                  error = conditionMessage)
+stopifnot(grepl("exited without a result", error, fixed = TRUE))
+
+sloped <- terra::rast(dtm_path)
+slope <- 2 + 0.02 * terra::colFromCell(sloped, seq_len(terra::ncell(sloped)))
+slope[[bad_cell]] <- NA_real_
+terra::values(sloped) <- slope
+sloped_path <- file.path(work, "sloped.tif")
+terra::writeRaster(sloped, sloped_path)
+bilinear <- parallel_config
+bilinear$segmentation_specs <- bilinear$segmentation_specs[1L]
+bilinear$dtm <- sloped_path
+bilinear$dtm_lookup <- "bilinear"
+bilinear$dtm_fill_radius <- 1L
+bilinear$output_dir <- file.path(work, "bilinear-owned")
+logs <- capture.output(run_tool(bilinear), type = "message")
+stopifnot("CSP workflow: bilinear DTM lookup" %in% logs)
+manifest <- jsonlite::fromJSON(file.path(bilinear$output_dir, "manifest.json"))
+metadata <- jsonlite::fromJSON(file.path(bilinear$output_dir, "run_metadata.json"))
+stopifnot(identical(manifest$dtm$terrain_lookup, "bilinear"),
+          identical(manifest$dtm$fill_radius_cells, 1L), manifest$dtm$filled_cells == 1L,
+          manifest$dtm$fill_cap_m == 1, manifest$dtm$max_fill_distance_m == 1,
+          identical(metadata$terrain_lookup, "bilinear"),
+          identical(metadata$dtm_fill_radius_cells, 1L), metadata$dtm_filled_cells == 1L,
+          metadata$dtm_fill_cap_m == 1, metadata$dtm_max_fill_distance_m == 1)
+owned_bilinear <- read_inventory(bilinear$output_dir, "FM")
+bilinear$output_dir <- file.path(work, "bilinear-sequential")
+bilinear$inventory_read_mode <- "sequential"
+bilinear$inventory_index_workers <- 0L
+run_tool(bilinear)
+columns <- c("instance_id", "point_count", "x", "y", "z", "height_m", "convex_hull_area_m2")
+stopifnot(isTRUE(all.equal(owned_bilinear[, ..columns],
+                          read_inventory(bilinear$output_dir, "FM")[, ..columns],
+                          tolerance = 1e-7)))
 stopifnot(!length(list.files(work, pattern = "\\.bin$", recursive = TRUE)))
 unlink(work, recursive = TRUE)
 cat("complete-instance owned COPC integration tests passed\n")

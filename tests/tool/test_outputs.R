@@ -56,6 +56,7 @@ stopifnot(summary$dbh_measured_tree_count == 1L,
           summary$dbh_coverage_fraction == 0.5,
           is.na(summary$basal_area_m2_per_ha))
 config <- list(
+  dtm_lookup = "nearest", dtm_fill_radius = 0L,
   species_lookup = lookup_path,
   segmentation_specs = list(list(instance = "PredInstance_SAT", source = "SAT",
                                  species = "species_id_SAT", species_prob = "species_prob_SAT"))
@@ -78,6 +79,11 @@ written <- write_inventory_manifest(exports, modifyList(config, list(debug_outpu
 manifest <- jsonlite::fromJSON(file.path(stage, "manifest.json"), simplifyVector = FALSE)
 stopifnot(identical(manifest$schema_version, "1.0.0"),
           identical(manifest$dtm$source, "supplied"),
+          identical(manifest$dtm$terrain_lookup, "nearest"),
+          identical(manifest$dtm$fill_radius_cells, 0L),
+          identical(manifest$dtm$fill_cap_m, 0L),
+          identical(manifest$dtm$filled_cells, 0L),
+          identical(manifest$dtm$max_fill_distance_m, 0L),
           identical(manifest$segmentations[[1L]]$potree_instance_dimension, "PredInstance_SAT"))
 invalid <- written
 invalid$schema_version <- "0.0.0"

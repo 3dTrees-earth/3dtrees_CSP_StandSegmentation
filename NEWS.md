@@ -1,3 +1,28 @@
+# CspStandSegmentation 1.0.0 (3Dtrees fork), second re-release
+
+- Inventory accepts unlabelled local coordinates with metre units assumed and
+  EPSG:4978 stand-ins within 6,000 km of the origin. Stand summaries show
+  `local (assumed metres)` or `local (EPSG:4978 stand-in)`, with blank longitude
+  and latitude. Geographic and genuine geocentric inputs are refused, as
+  are unlabelled bounds with suspicious spans or elevations and wrapped
+  stand-ins at or beyond 6,000 km. Empty WKT is treated as missing and the
+  sequential and owned readers reject non-finite or inverted Z bounds.
+- Local inventory accepts a matching unlabelled or stand-in DTM. A projected
+  metre DTM already in the local cloud frame requires `--dtm-crs-local-ok true`
+  (default `false`). Debug metadata records the original DTM CRS.
+- Terrain heights use bilinear interpolation of the DTM by default (`--dtm-lookup bilinear`); `--dtm-lookup nearest` gives the earlier 1.0.0 behaviour. Heights, stem bands and therefore DBH and height values change slightly against the earlier 1.0.0 builds (DBH counts −4 to +2 on five test plots).
+  NoData cells under points use the nearest finite terrain by default, up
+  to `--dtm-fill-max-distance 5` metres between cell centres. The run warns
+  and records the distinct cells used and the largest fill distance in
+  `run_metadata.json`, including runs without debug outputs. Published
+  rasters preserve the original elevations and NoData. Set
+  `--dtm-fill-radius 0` or `--dtm-fill-max-distance 0` for strict handling.
+- Generated DTM GeoTIFFs use the fixed band name `dtm`, changing file hashes
+  relative to 1.0.0 without changing values, CRS or extent.
+- COPC inventory reports the underlying R worker error, including missing
+  terrain under inventoried points, and reports when a worker exits without a
+  result.
+
 # CspStandSegmentation 1.0.0 (3Dtrees fork)
 
 ## Breaking changes
